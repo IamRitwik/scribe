@@ -11,3 +11,5 @@ require (
 	github.com/soheilhy/cmux v0.1.5
 	github.com/tysonmote/gommap v0.0.2 // NOT tysontate — that path is stale
 )
+
+require google.golang.org/protobuf v1.36.12 // indirect
