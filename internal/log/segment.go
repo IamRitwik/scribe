@@ -82,24 +82,26 @@ func newSegment(dir string, baseOffset uint64, c Config) (*segment, error) {
 // serialize the Record, convert protobuf record into bytes
 // append to store
 // write the mapping into index
-func (s *segment) Append(record *api.Record) (offset uint64, err error) {
+func (s *segment) Append(record *api.Record) (uint64, error) {
 	cur := s.nextOffset
 	record.Offset = cur
+
 	p, err := proto.Marshal(record)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("marshal record: %w", err)
 	}
+
 	_, pos, err := s.store.Append(p)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("append to store: %w", err)
 	}
+
 	err = s.index.Write(
-		// index offsets are relative to base offset
-		uint32(s.nextOffset-uint64(s.baseOffset)),
+		uint32(s.nextOffset-s.baseOffset),
 		pos,
 	)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("write index: %w", err)
 	}
 
 	s.nextOffset++
@@ -132,7 +134,8 @@ func (s *segment) Read(off uint64) (*api.Record, error) {
 }
 
 func (s *segment) IsMaxed() bool {
-	return s.store.size >= s.config.Segment.MaxStoreBytes || s.index.size >= s.config.Segment.MaxIndexBytes
+	return s.store.size >= s.config.Segment.MaxStoreBytes ||
+		s.index.size+entWidth > s.config.Segment.MaxIndexBytes
 }
 
 func (s *segment) Remove() error {

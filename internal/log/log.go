@@ -112,14 +112,27 @@ func (l *Log) Append(record *api.Record) (uint64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	// if active segment is already full, rotate before append
+	if l.activeSegment.IsMaxed() {
+		err := l.newSegment(l.activeSegment.nextOffset)
+		if err != nil {
+			return 0, err
+		}
+	}
+
 	off, err := l.activeSegment.Append(record)
 	if err != nil {
 		return 0, err
 	}
+
+	// rotate after append if the record filled the active segment
 	if l.activeSegment.IsMaxed() {
 		err = l.newSegment(off + 1)
+		if err != nil {
+			return 0, err
+		}
 	}
-	return off, err
+	return off, nil
 }
 
 // identify the segment owing the offset

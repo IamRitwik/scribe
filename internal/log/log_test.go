@@ -248,3 +248,88 @@ func TestLogAppendAcrossSegmentRotation(t *testing.T) {
 		}
 	}
 }
+
+func TestLogRotatesWhenIndexIsFull(t *testing.T) {
+	dir := t.TempDir()
+
+	// Each index entry is 12 bytes.
+	// A 24-byte index can therefore hold exactly two records.
+	var config Config
+	config.Segment.MaxStoreBytes = 1 << 20
+	config.Segment.MaxIndexBytes = 2 * entWidth
+
+	l, err := NewLog(dir, config)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	// Append three records. The third must go into a new segment.
+	for i := 0; i < 3; i++ {
+		record := &api.Record{
+			Value: []byte(fmt.Sprintf("record-%d", i)),
+		}
+
+		offset, err := l.Append(record)
+		if err != nil {
+			t.Fatalf("append record %d: %v", i, err)
+		}
+
+		if offset != uint64(i) {
+			t.Fatalf("expected offset %d, got %d", i, offset)
+		}
+	}
+
+	// Two segments should exist:
+	// Segment 0: offsets 0 and 1
+	// Segment 1: offset 2
+	if got, want := len(l.segments), 2; got != want {
+		t.Fatalf("expected %d segments, got %d", want, got)
+	}
+
+	if got, want := l.segments[0].nextOffset, uint64(2); got != want {
+		t.Fatalf("first segment nextOffset: expected %d, got %d", want, got)
+	}
+
+	if got, want := l.segments[1].baseOffset, uint64(2); got != want {
+		t.Fatalf("second segment baseOffset: expected %d, got %d", want, got)
+	}
+
+	// Verify all records can be read back.
+	for i := 0; i < 3; i++ {
+		record, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("read offset %d: %v", i, err)
+		}
+
+		expected := fmt.Sprintf("record-%d", i)
+		if string(record.Value) != expected {
+			t.Fatalf("offset %d: expected %q, got %q",
+				i, expected, string(record.Value))
+		}
+	}
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("close log: %v", err)
+	}
+
+	// Reopen the log and verify that segment metadata and records
+	// were persisted correctly.
+	l, err = NewLog(dir, config)
+	if err != nil {
+		t.Fatalf("reopen log: %v", err)
+	}
+	defer l.Close()
+
+	for i := 0; i < 3; i++ {
+		record, err := l.Read(uint64(i))
+		if err != nil {
+			t.Fatalf("read offset %d after reopening: %v", i, err)
+		}
+
+		expected := fmt.Sprintf("record-%d", i)
+		if string(record.Value) != expected {
+			t.Fatalf("after reopening, offset %d: expected %q, got %q",
+				i, expected, string(record.Value))
+		}
+	}
+}
