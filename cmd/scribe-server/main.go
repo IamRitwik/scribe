@@ -13,6 +13,7 @@ import (
 	"github.com/IamRitwik/scribe/internal/config"
 	scribeLog "github.com/IamRitwik/scribe/internal/log"
 	server "github.com/IamRitwik/scribe/internal/server"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -22,8 +23,18 @@ func main() {
 	logConfig.Segment.MaxStoreBytes = 1024
 	logConfig.Segment.MaxIndexBytes = 1024
 	logConfig.Segment.InitialOffset = 0
-
 	dataDir := "./data"
+
+	logger, err := zap.NewProduction()
+	if err != nil {
+		log.Fatalf("failed to initialize logger: %v", err)
+	}
+	zap.ReplaceGlobals(logger)
+	defer func() {
+		if err := logger.Sync(); err != nil {
+			log.Printf("failed to sync logger: %v", err)
+		}
+	}()
 
 	commitLog, err := scribeLog.NewLog(dataDir, logConfig)
 	if err != nil {

@@ -9,12 +9,17 @@ import (
 
 	api "github.com/IamRitwik/scribe/api/v1"
 	"github.com/IamRitwik/scribe/internal/config"
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/stats/view"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
 func main() {
+	if err := view.Register(ocgrpc.DefaultClientViews...); err != nil {
+		log.Fatalf("failed to register client metric views: %v", err)
+	}
 	tlsConfig, err := config.SetupTLSConfig(config.TLSConfig{
 		CertFile:      config.RootClientCertFile,
 		KeyFile:       config.RootClientKeyFile,
@@ -32,6 +37,7 @@ func main() {
 		grpc.WithTransportCredentials(
 			credentials.NewTLS(tlsConfig),
 		),
+		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
 	)
 	if err != nil {
 		log.Fatalf("failed to create gRPC client: %v", err)

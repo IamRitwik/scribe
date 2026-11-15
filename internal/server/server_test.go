@@ -9,15 +9,23 @@ import (
 	"testing"
 	"time"
 
+	"sync"
+
 	api "github.com/IamRitwik/scribe/api/v1"
 	"github.com/IamRitwik/scribe/internal/auth"
 	"github.com/IamRitwik/scribe/internal/config"
 	scribeLog "github.com/IamRitwik/scribe/internal/log"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
+
+	"go.opencensus.io/stats/view"
+	"go.opencensus.io/trace"
 )
 
 type testEnv struct {
@@ -334,4 +342,224 @@ func testUntrustedServerCA(t *testing.T, env *testEnv) {
 
 func testWrongServerName(t *testing.T, env *testEnv) {
 	assertRPCFails(t, env.wrongNameClient)
+}
+
+type telemetryTestExporter struct {
+	mu    sync.Mutex
+	views []*view.Data
+	spans []*trace.SpanData
+
+	viewCh chan *view.Data
+	spanCh chan *trace.SpanData
+}
+
+var _ view.Exporter = (*telemetryTestExporter)(nil)
+var _ trace.Exporter = (*telemetryTestExporter)(nil)
+
+func newTelemetryTestExporter(t *testing.T) *telemetryTestExporter {
+	t.Helper()
+
+	exporter := &telemetryTestExporter{
+		viewCh: make(chan *view.Data, 100),
+		spanCh: make(chan *trace.SpanData, 100),
+	}
+
+	view.RegisterExporter(exporter)
+	trace.RegisterExporter(exporter)
+
+	// Make metrics available quickly during tests.
+	view.SetReportingPeriod(100 * time.Millisecond)
+
+	// Make sure server RPC spans are sampled.
+	trace.ApplyConfig(trace.Config{
+		DefaultSampler: trace.AlwaysSample(),
+	})
+
+	t.Cleanup(func() {
+		view.UnregisterExporter(exporter)
+		trace.UnregisterExporter(exporter)
+		view.SetReportingPeriod(0)
+	})
+
+	return exporter
+}
+
+func (e *telemetryTestExporter) ExportView(data *view.Data) {
+	if data == nil || len(data.Rows) == 0 {
+		return
+	}
+
+	e.mu.Lock()
+	e.views = append(e.views, data)
+	e.mu.Unlock()
+
+	select {
+	case e.viewCh <- data:
+	default:
+	}
+}
+
+func (e *telemetryTestExporter) ExportSpan(span *trace.SpanData) {
+	if span == nil {
+		return
+	}
+
+	e.mu.Lock()
+	e.spans = append(e.spans, span)
+	e.mu.Unlock()
+
+	select {
+	case e.spanCh <- span:
+	default:
+	}
+}
+
+func (e *telemetryTestExporter) getViews() []*view.Data {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	result := make([]*view.Data, len(e.views))
+	copy(result, e.views)
+	return result
+}
+
+func (e *telemetryTestExporter) getSpans() []*trace.SpanData {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	result := make([]*trace.SpanData, len(e.spans))
+	copy(result, e.spans)
+	return result
+}
+
+func TestServerStructuredLogging(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	logger := zap.New(core)
+
+	restore := zap.ReplaceGlobals(logger)
+	defer restore()
+
+	env, teardown := setupTest(t)
+	defer teardown()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer cancel()
+
+	_, err := env.rootClient.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{
+			Value: []byte("structured logging test"),
+		},
+	})
+	require.NoError(t, err)
+
+	// Assert application-level structured logging.
+	entries := logs.FilterMessage("record appended").All()
+
+	require.Len(t, entries, 1)
+
+	fields := entries[0].ContextMap()
+
+	require.Equal(t, uint64(0), fields["offset"])
+	require.Equal(
+		t,
+		int64(len("structured logging test")),
+		fields["value_bytes"],
+	)
+
+	// Print all captured logs temporarily to identify the
+	// completion message emitted by your middleware.
+	for _, entry := range logs.All() {
+		t.Logf(
+			"Zap log: message=%q fields=%v",
+			entry.Message,
+			entry.ContextMap(),
+		)
+	}
+}
+
+func TestServerMetrics(t *testing.T) {
+	exporter := newTelemetryTestExporter(t)
+
+	env, teardown := setupTest(t)
+	defer teardown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := env.rootClient.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{
+			Value: []byte("metrics test"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Produce failed: %v", err)
+	}
+
+	// OpenCensus exports metrics periodically.
+	deadline := time.After(3 * time.Second)
+
+	for {
+		select {
+		case data := <-exporter.viewCh:
+			if data == nil || data.View == nil {
+				continue
+			}
+
+			t.Logf(
+				"received metric view: %s; rows: %d",
+				data.View.Name,
+				len(data.Rows),
+			)
+
+			// We received an actual aggregated measurement.
+			if len(data.Rows) > 0 {
+				return
+			}
+
+		case <-deadline:
+			t.Fatalf(
+				"timed out waiting for metrics; exported views: %d",
+				len(exporter.getViews()),
+			)
+		}
+	}
+}
+
+func TestServerTraces(t *testing.T) {
+	exporter := newTelemetryTestExporter(t)
+
+	env, teardown := setupTest(t)
+	defer teardown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := env.rootClient.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{
+			Value: []byte("tracing test"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Produce failed: %v", err)
+	}
+
+	select {
+	case span := <-exporter.spanCh:
+		if span.Name == "" {
+			t.Fatal("expected a span name")
+		}
+
+		t.Logf("trace span received: %s", span.Name)
+		t.Logf("trace ID: %x", span.SpanContext.TraceID)
+		t.Logf("span ID: %x", span.SpanContext.SpanID)
+
+	case <-time.After(3 * time.Second):
+		t.Fatalf(
+			"timed out waiting for trace span; exported spans: %d",
+			len(exporter.getSpans()),
+		)
+	}
 }
