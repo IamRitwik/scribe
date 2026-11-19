@@ -13,6 +13,7 @@ cluster orchestration, and user-defined events.
 import (
 	"net"
 
+	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
 	"go.uber.org/zap"
 )
@@ -160,7 +161,11 @@ func (m *Membership) Leave() error {
 }
 
 func (m *Membership) logError(err error, msg string, member serf.Member) {
-	m.logger.Error(
+	log := m.logger.Error
+	if err == raft.ErrNotLeader {
+		log = m.logger.Debug
+	}
+	log(
 		msg,
 		zap.Error(err),
 		zap.String("name", member.Name),
