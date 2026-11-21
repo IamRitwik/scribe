@@ -1,33 +1,55 @@
 package agent
 
 /*
-Serf - node discovery & membership
-gRPC - actual record replication, server stream
+Node 1 starts
+	 |
+Serf discovers Node 0
+	 |
+Serf emits member-join event
+	 |
+eventHandler() processes event
+	 |
+m.log.Join(nodeID, rpcAddr)
+	 |
+Raft AddVoter()
+	 |
+Node becomes a voting Raft member
 */
 
 import (
+	"bytes"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"sync"
+	"time"
 
-	api "github.com/IamRitwik/scribe/api/v1"
 	"github.com/IamRitwik/scribe/internal/auth"
 	"github.com/IamRitwik/scribe/internal/discovery"
 	"github.com/IamRitwik/scribe/internal/log"
 	"github.com/IamRitwik/scribe/internal/server"
+	"github.com/hashicorp/raft"
+	"github.com/soheilhy/cmux"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
+/*
+- cmux classifies a TCP connection once, when it arrives.
+- TLS secures that connection.
+- Raft's transport handles Raft RPC messages over it.
+- gRPC uses its own connection and HTTP/2 protocol.
+- Both services share the same TCP listening port, not the same application protocol or connection.
+*/
 type Agent struct {
-	Config
+	Config Config
 
-	log        *log.Log
+	mux        cmux.CMux
+	log        *log.DistributedLog
 	server     *grpc.Server
 	membership *discovery.Membership
-	replicator *log.Replicator
 
 	shutdown     bool
 	shutdowns    chan struct{}
@@ -44,6 +66,7 @@ type Config struct {
 	StartJoinAddrs  []string
 	ACLModelFile    string
 	ACLPolicyFile   string
+	Bootstrap       bool
 }
 
 func (c Config) RPCAddr() (string, error) {
@@ -66,6 +89,7 @@ func New(config Config) (*Agent, error) {
 	}
 	setup := []func() error{
 		a.setupLogger,
+		a.setupMux,
 		a.setupLog,
 		a.setupServer,
 		a.setupMembership,
@@ -76,7 +100,24 @@ func New(config Config) (*Agent, error) {
 			return nil, err
 		}
 	}
+	go a.serve()
 	return a, nil
+}
+
+// create a listener on our RPC address
+// that will accept both Raft and gRPC connections
+// then creates mux with the listener
+// mux accepts connections on that listener and match connections based on configured rules
+func (a *Agent) setupMux() error {
+	rpcAddr := fmt.Sprintf(":%d", a.Config.RPCPort)
+	// actual TCP listener
+	ln, err := net.Listen("tcp", rpcAddr)
+	if err != nil {
+		return err
+	}
+	// multiplexer that accepts connections from ln and distributes them
+	a.mux = cmux.New(ln)
+	return nil
 }
 
 func (a *Agent) setupLogger() error {
@@ -88,23 +129,54 @@ func (a *Agent) setupLogger() error {
 	return nil
 }
 
+// configure mux that matches Raft connection
+// we identify raft connection by reading 1 byte and
+// checking that the byte matches the byte we set up our ongoing Raft connections to write in StreamLayer
 func (a *Agent) setupLog() error {
-	var err error
-	a.log, err = log.NewLog(
-		a.Config.DataDir,
-		log.Config{},
+	raftLn := a.mux.Match(func(reader io.Reader) bool {
+		b := make([]byte, 1)
+		_, err := reader.Read(b)
+		if err != nil {
+			return false
+		}
+		return bytes.Compare(b, []byte{byte(log.RaftRPC)}) == 0
+	})
+	logConfig := log.Config{}
+	logConfig.Raft.StreamLayer = log.NewStreamLayer(
+		raftLn,
+		a.Config.ServerTLSConfig,
+		a.Config.PeerTLSConfig,
 	)
+	logConfig.Raft.LocalID = raft.ServerID(a.Config.NodeName)
+	logConfig.Raft.Bootstrap = a.Config.Bootstrap
+	var err error
+	a.log, err = log.NewDistributedLog(
+		a.Config.DataDir,
+		logConfig,
+	)
+	if err != nil {
+		return err
+	}
+	if a.Config.Bootstrap {
+		err = a.log.WaitForLeader(3 * time.Second)
+	}
 	return err
 }
 
+// we want Raft and gRPC server to share the same TCP port
+// we need a way to distinguish which incoming TCP connection belongs to Raft and which one to gRPC
 func (a *Agent) setupServer() error {
 	authorizer, err := auth.New(
 		a.Config.ACLModelFile,
 		a.Config.ACLPolicyFile,
 	)
+	if err != nil {
+		return err
+	}
 	serverConfig := &server.Config{
-		CommitLog:  a.log,
-		Authorizer: authorizer,
+		CommitLog:   a.log,
+		Authorizer:  authorizer,
+		GetServerer: a.log,
 	}
 
 	var opts []grpc.ServerOption
@@ -117,22 +189,13 @@ func (a *Agent) setupServer() error {
 	if err != nil {
 		return err
 	}
-
-	rpcAddr, err := a.RPCAddr()
-	if err != nil {
-		return err
-	}
-
-	ln, err := net.Listen("tcp", rpcAddr)
-	if err != nil {
-		return err
-	}
+	grpcLn := a.mux.Match(cmux.Any())
 	go func() {
-		err = a.server.Serve(ln)
-		if err != nil {
+		if err := a.server.Serve(grpcLn); err != nil {
 			_ = a.Shutdown()
 		}
 	}()
+
 	return err
 }
 
@@ -141,22 +204,7 @@ func (a *Agent) setupMembership() error {
 	if err != nil {
 		return err
 	}
-	var opts []grpc.DialOption
-	if a.Config.PeerTLSConfig != nil {
-		opts = append(opts, grpc.WithTransportCredentials(
-			credentials.NewTLS(a.Config.PeerTLSConfig),
-		))
-	}
-	conn, err := grpc.NewClient(rpcAddr, opts...)
-	if err != nil {
-		return err
-	}
-	client := api.NewLogClient(conn)
-	a.replicator = &log.Replicator{
-		DialOptions: opts,
-		LocalServer: client,
-	}
-	a.membership, err = discovery.New(a.replicator, discovery.Config{
+	a.membership, err = discovery.New(a.log, discovery.Config{
 		NodeName: a.Config.NodeName,
 		BindAddr: a.Config.BindAddr,
 		Tags: map[string]string{
@@ -177,7 +225,6 @@ func (a *Agent) Shutdown() error {
 	close(a.shutdowns)
 	shutdown := []func() error{
 		a.membership.Leave,
-		a.replicator.Close,
 		func() error {
 			a.server.GracefulStop()
 			return nil
@@ -188,6 +235,15 @@ func (a *Agent) Shutdown() error {
 		if err := fn(); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (a *Agent) serve() error {
+	err := a.mux.Serve()
+	if err != nil {
+		_ = a.Shutdown()
+		return err
 	}
 	return nil
 }

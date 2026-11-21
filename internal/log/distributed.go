@@ -290,6 +290,23 @@ func (l *DistributedLog) Close() error {
 	return l.log.Close()
 }
 
+func (l *DistributedLog) GetServers() ([]*api.Server, error) {
+	future := l.raft.GetConfiguration()
+	err := future.Error()
+	if err != nil {
+		return nil, err
+	}
+	var servers []*api.Server
+	for _, server := range future.Configuration().Servers {
+		servers = append(servers, &api.Server{
+			Id:       string(server.ID),
+			RpcAddr:  string(server.Address),
+			IsLeader: l.raft.Leader() == server.Address,
+		})
+	}
+	return servers, nil
+}
+
 // Finite State Machine
 var _ raft.FSM = (*fsm)(nil)
 
@@ -493,6 +510,9 @@ func NewStreamLayer(
 
 const RaftRPC = 1
 
+// the first byte sent over the TCP connection is 1
+// 0x01(Raft marker) sent before the TLS handshake
+// marker = connection identification prefix
 func (s *StreamLayer) Dial(
 	addr raft.ServerAddress,
 	timeout time.Duration,
@@ -502,13 +522,12 @@ func (s *StreamLayer) Dial(
 	if err != nil {
 		return nil, err
 	}
-	// START: identify_raft
 	// identify to mux this is a raft rpc
 	_, err = conn.Write([]byte{byte(RaftRPC)})
 	if err != nil {
 		return nil, err
 	}
-	// END: identify_raft
+
 	if s.peerTLSConfig != nil {
 		conn = tls.Client(conn, s.peerTLSConfig)
 	}

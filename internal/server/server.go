@@ -33,10 +33,15 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type GetServerer interface {
+	GetServers() ([]*api.Server, error)
+}
+
 // Config provides dependency to gRPC server
 type Config struct {
-	CommitLog  CommitLog
-	Authorizer Authorizer
+	CommitLog   CommitLog
+	Authorizer  Authorizer
+	GetServerer GetServerer
 }
 
 const (
@@ -64,6 +69,16 @@ func newgrpcServer(config *Config) (srv *grpcServer, err error) {
 		Config: config,
 	}
 	return srv, nil
+}
+
+func (s *grpcServer) GetServers(
+	ctx context.Context, req *api.GetServersRequest,
+) (*api.GetServersResponse, error) {
+	servers, err := s.GetServerer.GetServers()
+	if err != nil {
+		return nil, err
+	}
+	return &api.GetServersResponse{Servers: servers}, nil
 }
 
 /*

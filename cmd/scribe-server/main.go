@@ -1,30 +1,61 @@
 package main
 
+/*
+Node	Serf membership port	gRPC/Raft port	Data directory
+--------------------------------------------------------------
+node-1			8401				8400		data/node-1
+node-2			8403				8402		data/node-2
+node-3			8405				8404		data/node-3
+
+Terminal 1:
+SCRIBE_NODE_NAME=node-1 \
+SCRIBE_BIND_ADDR=127.0.0.1:8401 \
+SCRIBE_RPC_PORT=8400 \
+SCRIBE_DATA_DIR=./data/node-1 \
+SCRIBE_BOOTSTRAP=true \
+./bin/scribe-server
+
+Terminal 2:
+SCRIBE_NODE_NAME=node-2 \
+SCRIBE_BIND_ADDR=127.0.0.1:8403 \
+SCRIBE_RPC_PORT=8402 \
+SCRIBE_DATA_DIR=./data/node-2 \
+SCRIBE_BOOTSTRAP=false \
+SCRIBE_START_JOIN_ADDRS=127.0.0.1:8401 \
+./bin/scribe-server
+
+SCRIBE_NODE_NAME=node-3 \
+SCRIBE_BIND_ADDR=127.0.0.1:8405 \
+SCRIBE_RPC_PORT=8404 \
+SCRIBE_DATA_DIR=./data/node-3 \
+SCRIBE_BOOTSTRAP=false \
+SCRIBE_START_JOIN_ADDRS=127.0.0.1:8401 \
+./bin/scribe-server
+*/
+
 import (
 	"crypto/tls"
 	"errors"
 	"log"
-	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 
-	"github.com/IamRitwik/scribe/internal/auth"
+	"github.com/IamRitwik/scribe/internal/agent"
 	"github.com/IamRitwik/scribe/internal/config"
-	scribeLog "github.com/IamRitwik/scribe/internal/log"
-	server "github.com/IamRitwik/scribe/internal/server"
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
-func main() {
-	logConfig := scribeLog.Config{}
-	logConfig.Segment.MaxStoreBytes = 1024
-	logConfig.Segment.MaxIndexBytes = 1024
-	logConfig.Segment.InitialOffset = 0
-	dataDir := "./data"
+func env(key string, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
 
+func main() {
 	logger, err := zap.NewProduction()
 	if err != nil {
 		log.Fatalf("failed to initialize logger: %v", err)
@@ -36,75 +67,107 @@ func main() {
 		}
 	}()
 
-	commitLog, err := scribeLog.NewLog(dataDir, logConfig)
+	nodeName := env("SCRIBE_NODE_NAME", "node-1")
+	bindAddr := env("SCRIBE_BIND_ADDR", "127.0.0.1:8401")
+	rpcPort, err := strconv.Atoi(env("SCRIBE_RPC_PORT", "8400"))
 	if err != nil {
-		log.Fatalf("failed to create commit log: %v", err)
+		log.Fatalf("invalid RPC port: %v", err)
 	}
 
-	defer func() {
-		if err := commitLog.Close(); err != nil {
-			log.Printf("failed to close commit log: %v", err)
+	dataDir := env("SCRIBE_DATA_DIR", "./data/"+nodeName)
+
+	bootstrap, err := strconv.ParseBool(env("SCRIBE_BOOTSTRAP", "false"))
+	if err != nil {
+		log.Fatalf("invalid bootstrap value: %v", err)
+	}
+
+	var startJoinAddrs []string
+	joinAddrs := env("SCRIBE_START_JOIN_ADDRS", "")
+	if joinAddrs != "" {
+		for _, addr := range strings.Split(joinAddrs, ",") {
+			addr = strings.TrimSpace(addr)
+			if addr != "" {
+				startJoinAddrs = append(startJoinAddrs, addr)
+			}
 		}
-	}()
-
-	// Initialize application authorization.
-	authorizer, err := auth.New(
-		config.ACLModelFile,
-		config.ACLPolicyFile,
-	)
-	if err != nil {
-		log.Fatalf("failed to initialize authorizer: %v", err)
 	}
 
-	// Configure server-side mutual TLS.
-	tlsConfig, err := config.SetupTLSConfig(config.TLSConfig{
+	// Configure the client-facing gRPC server's mutual TLS.
+	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
 		CertFile: config.ServerCertFile,
 		KeyFile:  config.ServerKeyFile,
 		CAFile:   config.CAFile,
 		Server:   true,
 	})
 	if err != nil {
-		log.Fatalf("failed to configure TLS: %v", err)
+		log.Fatalf("failed to configure server TLS: %v", err)
+	}
+	serverTLSConfig.MinVersion = tls.VersionTLS12
+
+	// For this local smoke test, reuse the TLS configuration.
+	// Your peer certificates must be valid for both client and server
+	// authentication. If your agent tests use a separate peerTLSConfig,
+	// use that same configuration here instead.
+	peerTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      config.RootClientCertFile,
+		KeyFile:       config.RootClientKeyFile,
+		CAFile:        config.CAFile,
+		Server:        false,
+		ServerAddress: "127.0.0.1",
+	})
+
+	if err != nil {
+		log.Fatalf("failed to configure peer TLS: %v", err)
+	}
+	peerTLSConfig.MinVersion = tls.VersionTLS12
+
+	agentConfig := agent.Config{
+		ServerTLSConfig: serverTLSConfig,
+		PeerTLSConfig:   peerTLSConfig,
+
+		DataDir: dataDir,
+
+		NodeName:       nodeName,
+		BindAddr:       bindAddr,
+		RPCPort:        rpcPort,
+		Bootstrap:      bootstrap,
+		StartJoinAddrs: startJoinAddrs,
+
+		ACLModelFile:  config.ACLModelFile,
+		ACLPolicyFile: config.ACLPolicyFile,
 	}
 
-	tlsConfig.MinVersion = tls.VersionTLS12 // TLS 1.2 minimum
+	scribeAgent, err := agent.New(agentConfig)
+	if err != nil {
+		log.Fatalf("failed to start Scribe agent: %v", err)
+	}
 
-	// Inject the log into gRPC server
-	grpcServer, err := server.NewGRPCServer(
-		&server.Config{
-			CommitLog:  commitLog,
-			Authorizer: authorizer,
-		},
-		grpc.Creds(credentials.NewTLS(tlsConfig)),
+	rpcAddr, err := scribeAgent.Config.RPCAddr()
+	if err != nil {
+		log.Fatalf("failed to get RPC address: %v", err)
+	}
+
+	log.Printf(
+		"Scribe agent started: node=%s serf=%s rpc=%s bootstrap=%t data=%s",
+		nodeName,
+		bindAddr,
+		rpcAddr,
+		bootstrap,
+		dataDir,
 	)
-	if err != nil {
-		log.Fatalf("failed to create gRPC server: %v", err)
-	}
-
-	var PORT string = ":8400"
-	lis, err := net.Listen("tcp", PORT)
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
 
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
+	<-signals
+	signal.Stop(signals)
 
-	go func() {
-		<-signals
-		log.Println("shutdown signal received...")
-		log.Println("gracefully stopping gRPC server...")
+	log.Printf("shutting down Scribe node %s...", nodeName)
 
-		grpcServer.GracefulStop()
-	}()
-
-	log.Println("Scribe listening with mutual TLS on", PORT)
-
-	err = grpcServer.Serve(lis)
-	if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
-		log.Printf("gRPC server stopped with error: %v", err)
+	if err := scribeAgent.Shutdown(); err != nil {
+		if !errors.Is(err, os.ErrClosed) {
+			log.Printf("error shutting down agent: %v", err)
+		}
 	}
 
-	log.Println("gRPC server stopped!")
+	log.Printf("Scribe node %s stopped", nodeName)
 }

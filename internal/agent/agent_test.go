@@ -5,17 +5,16 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 
 	api "github.com/IamRitwik/scribe/api/v1"
 	"github.com/IamRitwik/scribe/internal/agent"
 	"github.com/IamRitwik/scribe/internal/config"
 
+	"github.com/IamRitwik/scribe/internal/loadbalance"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -62,12 +61,10 @@ func TestAgent(t *testing.T) {
 	// Start three agents.
 	var agents []*agent.Agent
 
-	// Register cleanup before starting agents, so partially
-	// initialized test clusters are cleaned up too.
+	// Register cleanup before starting agents.
 	t.Cleanup(func() {
 		for _, a := range agents {
 			require.NoError(t, a.Shutdown())
-			require.NoError(t, os.RemoveAll(a.Config.DataDir))
 		}
 	})
 
@@ -79,10 +76,8 @@ func TestAgent(t *testing.T) {
 			strconv.Itoa(serfPort),
 		)
 
-		dataDir, err := os.MkdirTemp("", "agent-test-log")
-		require.NoError(t, err)
-
 		var startJoinAddrs []string
+
 		if i != 0 {
 			startJoinAddrs = []string{
 				agents[0].Config.BindAddr,
@@ -94,26 +89,38 @@ func TestAgent(t *testing.T) {
 			StartJoinAddrs:  startJoinAddrs,
 			BindAddr:        bindAddr,
 			RPCPort:         rpcPort,
-			DataDir:         dataDir,
+			DataDir:         t.TempDir(),
 			ACLModelFile:    config.ACLModelFile,
 			ACLPolicyFile:   config.ACLPolicyFile,
 			ServerTLSConfig: serverTLSConfig,
 			PeerTLSConfig:   peerTLSConfig,
+
+			// Only Node 0 bootstraps the initial Raft cluster.
+			Bootstrap: i == 0,
 		})
 		require.NoError(t, err)
 
 		agents = append(agents, a)
 	}
 
-	// Give the Serf membership events a little time to propagate.
-	// The actual replication assertion below is still condition-based.
-	time.Sleep(500 * time.Millisecond)
+	// Connect to Node 0, which bootstrapped the Raft cluster.
+	// Connect through the Scribe resolver and picker.
+	// Node 0 is only the bootstrap node.
+	clusterClient := loadBalancedClient(
+		t,
+		agents[0],
+		peerTLSConfig,
+	)
 
-	// Produce a record on the first agent.
-	leaderClient := client(t, agents[0], peerTLSConfig)
-
-	produceResponse, err := leaderClient.Produce(
+	ctx, cancel := context.WithTimeout(
 		context.Background(),
+		10*time.Second,
+	)
+	defer cancel()
+
+	// Produce should be routed to the Raft leader.
+	produceResponse, err := clusterClient.Produce(
+		ctx,
 		&api.ProduceRequest{
 			Record: &api.Record{
 				Value: []byte("foo"),
@@ -122,34 +129,54 @@ func TestAgent(t *testing.T) {
 	)
 	require.NoError(t, err)
 
-	// Verify that the record can be consumed from the first agent.
-	consumeResponse, err := leaderClient.Consume(
-		context.Background(),
-		&api.ConsumeRequest{
-			Offset: produceResponse.Offset,
-		},
-	)
-	require.NoError(t, err)
-	require.Equal(t, []byte("foo"), consumeResponse.Record.Value)
+	// Verify that the record eventually appears on both followers.
+	// We use direct connections here so that we independently verify
+	// replication to each specific follower.
+	for i := 1; i < 3; i++ {
+		followerClient := client(t, agents[i], peerTLSConfig)
 
-	// Wait until the record has been replicated to the second agent.
-	followerClient := client(t, agents[1], peerTLSConfig)
+		require.Eventually(
+			t,
+			func() bool {
+				response, err := followerClient.Consume(
+					context.Background(),
+					&api.ConsumeRequest{
+						Offset: produceResponse.Offset,
+					},
+				)
 
-	require.Eventually(t, func() bool {
-		response, err := followerClient.Consume(
-			context.Background(),
+				if err != nil {
+					return false
+				}
+
+				return string(response.Record.Value) == "foo"
+			},
+			10*time.Second,
+			100*time.Millisecond,
+			fmt.Sprintf(
+				"record was not replicated to node %d",
+				i,
+			),
+		)
+	}
+
+	// Now consume through the load-balanced client.
+	// The picker should distribute these calls across followers.
+	for i := 0; i < 6; i++ {
+		response, err := clusterClient.Consume(
+			ctx,
 			&api.ConsumeRequest{
 				Offset: produceResponse.Offset,
 			},
 		)
-		if err != nil {
-			return false
-		}
 
-		return string(response.Record.Value) == "foo"
-	}, 10*time.Second, 100*time.Millisecond,
-		"record was not replicated to follower",
-	)
+		require.NoError(t, err)
+		require.Equal(
+			t,
+			[]byte("foo"),
+			response.Record.Value,
+		)
+	}
 }
 
 func client(
@@ -169,6 +196,37 @@ func client(
 	require.NoError(t, err)
 
 	conn, err := grpc.NewClient(rpcAddr, opts...)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		require.NoError(t, conn.Close())
+	})
+
+	return api.NewLogClient(conn)
+}
+
+func loadBalancedClient(
+	t *testing.T,
+	a *agent.Agent,
+	tlsConfig *tls.Config,
+) api.LogClient {
+	t.Helper()
+
+	tlsCreds := credentials.NewTLS(tlsConfig)
+
+	rpcAddr, err := a.Config.RPCAddr()
+	require.NoError(t, err)
+
+	target := fmt.Sprintf(
+		"%s://%s",
+		loadbalance.Name,
+		rpcAddr,
+	)
+
+	conn, err := grpc.NewClient(
+		target,
+		grpc.WithTransportCredentials(tlsCreds),
+	)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {

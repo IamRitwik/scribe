@@ -9,6 +9,7 @@ require (
 	github.com/hashicorp/raft v1.8.0
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/hashicorp/serf v0.11.0
+	github.com/soheilhy/cmux v0.1.5
 	github.com/stretchr/testify v1.12.1
 	github.com/tysonmote/gommap v0.0.3
 	go.opencensus.io v0.22.2

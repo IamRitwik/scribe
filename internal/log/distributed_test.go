@@ -74,6 +74,30 @@ func TestMultipleNodes(t *testing.T) {
 		addresses = append(addresses, addr)
 	}
 
+	// Verify that GetServers returns all cluster members.
+	servers, err := leader.GetServers()
+	require.NoError(t, err)
+	require.Len(t, servers, nodeCount)
+
+	for _, server := range servers {
+		switch server.Id {
+		case "0":
+			require.Equal(t, addresses[0], server.RpcAddr)
+			require.True(t, server.IsLeader)
+
+		case "1":
+			require.Equal(t, addresses[1], server.RpcAddr)
+			require.False(t, server.IsLeader)
+
+		case "2":
+			require.Equal(t, addresses[2], server.RpcAddr)
+			require.False(t, server.IsLeader)
+
+		default:
+			t.Fatalf("unexpected server ID: %s", server.Id)
+		}
+	}
+
 	// Test replication from the leader to every follower.
 	records := []*api.Record{
 		{Value: []byte("first")},
@@ -104,8 +128,25 @@ func TestMultipleNodes(t *testing.T) {
 	}
 
 	// Remove node 1 from the Raft cluster.
-	err := leader.Leave("1")
+	err = leader.Leave("1")
 	require.NoError(t, err)
+
+	// Verify that the cluster configuration reflects the removal.
+	servers, err = leader.GetServers()
+	require.NoError(t, err)
+	require.Len(t, servers, 2)
+
+	for _, server := range servers {
+		require.NotEqual(t, "1", server.Id)
+
+		if server.Id == "0" {
+			require.True(t, server.IsLeader)
+		}
+
+		if server.Id == "2" {
+			require.False(t, server.IsLeader)
+		}
+	}
 
 	// Append another record after the membership change.
 	off, err := leader.Append(&api.Record{
