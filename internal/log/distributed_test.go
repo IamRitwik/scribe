@@ -1,4 +1,4 @@
-package log_test
+package log
 
 import (
 	"fmt"
@@ -8,7 +8,6 @@ import (
 	"time"
 
 	api "github.com/IamRitwik/scribe/api/v1"
-	"github.com/IamRitwik/scribe/internal/log"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
 )
@@ -17,7 +16,7 @@ func newTestDistributedLog(
 	t *testing.T,
 	id string,
 	bootstrap bool,
-) (*log.DistributedLog, string) {
+) (*DistributedLog, string) {
 	t.Helper()
 
 	dataDir := t.TempDir()
@@ -26,8 +25,8 @@ func newTestDistributedLog(
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	config := log.Config{}
-	config.Raft.StreamLayer = log.NewStreamLayer(ln, nil, nil)
+	config := Config{}
+	config.Raft.StreamLayer = NewStreamLayer(ln, nil, nil)
 	config.Raft.LocalID = raft.ServerID(id)
 	config.Raft.Bootstrap = bootstrap
 
@@ -36,8 +35,9 @@ func newTestDistributedLog(
 	config.Raft.ElectionTimeout = 50 * time.Millisecond
 	config.Raft.LeaderLeaseTimeout = 50 * time.Millisecond
 	config.Raft.CommitTimeout = 5 * time.Millisecond
+	config.Raft.BindAddr = ln.Addr().String()
 
-	l, err := log.NewDistributedLog(dataDir, config)
+	l, err := NewDistributedLog(dataDir, config)
 	require.NoError(t, err)
 
 	// Close the distributed log when the test finishes.
@@ -51,7 +51,7 @@ func newTestDistributedLog(
 func TestMultipleNodes(t *testing.T) {
 	const nodeCount = 3
 
-	logs := make([]*log.DistributedLog, 0, nodeCount)
+	logs := make([]*DistributedLog, 0, nodeCount)
 	addresses := make([]string, 0, nodeCount)
 
 	// Start the first node as the bootstrap node.
@@ -167,4 +167,29 @@ func TestMultipleNodes(t *testing.T) {
 		_, err := logs[1].Read(off)
 		return reflect.TypeOf(err) == reflect.TypeOf(api.ErrOffsetOutOfRange{})
 	}, 2*time.Second, 50*time.Millisecond)
+}
+
+func TestStreamLayerAdvertiseAddr(t *testing.T) {
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	advertiseAddr, err := net.ResolveTCPAddr(
+		"tcp",
+		"127.0.0.1:8400",
+	)
+	require.NoError(t, err)
+
+	stream := NewStreamLayer(
+		ln,
+		nil,
+		nil,
+		advertiseAddr,
+	)
+
+	require.Equal(
+		t,
+		"127.0.0.1:8400",
+		stream.Addr().String(),
+	)
 }

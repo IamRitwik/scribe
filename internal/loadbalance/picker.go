@@ -11,7 +11,6 @@ Balancer framework	gRPC				Manages connections and invokes your picker
 
 import (
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"google.golang.org/grpc/balancer"
@@ -20,67 +19,80 @@ import (
 
 var _ base.PickerBuilder = (*Picker)(nil)
 
-type Picker struct {
-	mu        sync.RWMutex
+// Picker is the gRPC picker builder.
+// It creates a new immutable picker snapshot whenever gRPC calls Build.
+type Picker struct{}
+
+// picker is one immutable snapshot of the currently ready SubConns.
+// Only current changes, and it is updated atomically.
+type picker struct {
 	leader    balancer.SubConn
 	followers []balancer.SubConn
 	current   uint64
 }
 
+var _ balancer.Picker = (*picker)(nil)
+
 func (p *Picker) Build(buildInfo base.PickerBuildInfo) balancer.Picker {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var followers []balancer.SubConn
+	result := &picker{}
+
 	for sc, scInfo := range buildInfo.ReadySCs {
-		isLeader := scInfo.
-			Address.
-			Attributes.
-			Value("is_leader").(bool)
+		isLeader := false
+
+		if attrs := scInfo.Address.Attributes; attrs != nil {
+			value := attrs.Value("is_leader")
+			isLeader, _ = value.(bool)
+		}
+
 		if isLeader {
-			p.leader = sc
+			result.leader = sc
 			continue
 		}
-		followers = append(followers, sc)
+
+		result.followers = append(result.followers, sc)
 	}
-	p.followers = followers
-	return p
+
+	return result
 }
 
 /*
-- Produce requests must go to the leader.
-- Consume requests should be distributed across followers.
+Routing policy:
+- Produce requests go to the Raft leader.
+- Consume requests are distributed across ready followers.
 */
-
-var _ balancer.Picker = (*Picker)(nil)
-
-func (p *Picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
-	if p.leader == nil {
-		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
-	}
-
+func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	switch {
 	case strings.Contains(info.FullMethodName, "Produce"):
-		return balancer.PickResult{
-			SubConn: p.leader,
-		}, nil
+		if p.leader == nil {
+			return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+		}
+		return balancer.PickResult{SubConn: p.leader}, nil
 
 	case strings.Contains(info.FullMethodName, "Consume"):
-		return balancer.PickResult{
-			SubConn: p.leader,
-		}, nil
+		follower := p.nextFollower()
+		if follower == nil {
+			return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+		}
+		return balancer.PickResult{SubConn: follower}, nil
 
 	default:
-		return balancer.PickResult{
-			SubConn: p.leader,
-		}, nil
+		if p.leader == nil {
+			return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
+		}
+		return balancer.PickResult{SubConn: p.leader}, nil
 	}
 }
 
-func (p *Picker) nextFollower() balancer.SubConn {
-	cur := atomic.AddUint64(&p.current, uint64(1))
-	len := uint64(len(p.followers))
-	idx := int(cur % len)
-	return p.followers[idx]
+// nextFollower selects a ready follower using round-robin selection.
+func (p *picker) nextFollower() balancer.SubConn {
+	n := uint64(len(p.followers))
+	if n == 0 {
+		return nil
+	}
+
+	// Subtract one so the first call selects followers[0].
+	cur := atomic.AddUint64(&p.current, 1) - 1
+	return p.followers[cur%n]
 }
 
 func init() {

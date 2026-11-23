@@ -1,0 +1,93 @@
+# START: initial
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "scribe.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{ include "scribe.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {{ include "scribe.selectorLabels" . | nindent 6 }}
+  serviceName: {{ include "scribe.fullname" . }}
+  replicas: {{ .Values.replicas }}
+  template:
+    metadata:
+      name: {{ include "scribe.fullname" . }}
+      labels: {{ include "scribe.labels" . | nindent 8 }}
+    spec:
+      # initContainers...
+      # END: initial
+      # START: initial_containers
+      initContainers:
+      - name: {{ include "scribe.fullname" . }}-config-init
+        image: busybox
+        imagePullPolicy: IfNotPresent
+        command:          
+          - /bin/sh
+          - -c
+          - |-
+            ID=$(echo $HOSTNAME | rev | cut -d- -f1 | rev)
+            cat > /var/run/scribe/config.yaml <<EOD
+            data-dir: /var/run/scribe/data
+            rpc-port: {{.Values.rpcPort}}
+            bind-addr: "$HOSTNAME.scribe.{{.Release.Namespace}}.svc.cluster.local:{{.Values.serfPort}}"
+            $([ $ID != 0 ] && echo 'start-join-addrs: "scribe-0.scribe.{{.Release.Namespace}}.svc.cluster.local:{{.Values.serfPort}}"')
+            bootstrap: $([ $ID = 0 ] && echo true || echo false)
+            acl-model-file: /etc/scribe/model.conf
+            acl-policy-file: /etc/scribe/policy.csv
+            EOD
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/run/scribe
+        # START: initial
+      # END: initial_containers
+      # START: initial
+      # containers...
+      # END: initial
+      # START: containers
+      containers:
+      - name: {{ include "scribe.fullname" . }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        ports:
+        - containerPort: {{ .Values.rpcPort }}
+          name: rpc
+        - containerPort: {{ .Values.serfPort }}
+          name: serf
+        args:
+          - --config-file=/var/run/scribe/config.yaml
+        # END: initial
+        # probes...
+        # END: containers
+        # START: probes
+        readinessProbe:
+          grpc:
+            port: {{ .Values.rpcPort }}
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        livenessProbe:
+          grpc:
+            port: {{ .Values.rpcPort }}
+          initialDelaySeconds: 15
+          timeoutSeconds: 5
+        # END: probes
+        # START: containers
+        volumeMounts:
+        - name: datadir
+          mountPath: /var/run/scribe
+        - name: scribe-config-volume
+          mountPath: /etc/scribe
+          readOnly: true
+      volumes:
+      - name: scribe-config-volume
+        secret:
+          secretName: scribe-config
+      # END: containers
+      # START: initial
+  volumeClaimTemplates:
+  - metadata:
+      name: datadir
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: {{ .Values.storage }}

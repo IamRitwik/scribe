@@ -1,0 +1,71 @@
+
+# ==========================================
+# Scribe - Git Ignore
+# ==========================================
+
+# Keep the root README.md, ignore other Markdown files
+*.md
+!/README.md
+
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/bin/
+/build/
+/dist/
+/data
+/data-backup
+/docs
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Coverage and profiling
+coverage.out
+coverage.html
+*.prof
+*.pprof
+
+# Test artifacts
+test-results/

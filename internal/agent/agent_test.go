@@ -1,4 +1,4 @@
-package agent_test
+package agent
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"time"
 
 	api "github.com/IamRitwik/scribe/api/v1"
-	"github.com/IamRitwik/scribe/internal/agent"
 	"github.com/IamRitwik/scribe/internal/config"
 
 	"github.com/IamRitwik/scribe/internal/loadbalance"
@@ -59,12 +58,12 @@ func TestAgent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start three agents.
-	var agents []*agent.Agent
+	var agents []*Agent
 
 	// Register cleanup before starting agents.
 	t.Cleanup(func() {
-		for _, a := range agents {
-			require.NoError(t, a.Shutdown())
+		for i := len(agents) - 1; i >= 0; i-- {
+			require.NoError(t, agents[i].Shutdown())
 		}
 	})
 
@@ -84,7 +83,7 @@ func TestAgent(t *testing.T) {
 			}
 		}
 
-		a, err := agent.New(agent.Config{
+		a, err := New(Config{
 			NodeName:        fmt.Sprintf("%d", i),
 			StartJoinAddrs:  startJoinAddrs,
 			BindAddr:        bindAddr,
@@ -102,6 +101,27 @@ func TestAgent(t *testing.T) {
 
 		agents = append(agents, a)
 	}
+
+	// The resolver queries GetServers once when the client connects, so wait
+	// until Raft has a leader and all three nodes have joined the cluster.
+	require.Eventually(
+		t,
+		func() bool {
+			servers, err := agents[0].log.GetServers()
+			if err != nil || len(servers) != 3 {
+				return false
+			}
+			for _, server := range servers {
+				if server.IsLeader {
+					return true
+				}
+			}
+			return false
+		},
+		15*time.Second,
+		100*time.Millisecond,
+		"cluster did not elect a leader and gain all 3 members",
+	)
 
 	// Connect to Node 0, which bootstrapped the Raft cluster.
 	// Connect through the Scribe resolver and picker.
@@ -181,7 +201,7 @@ func TestAgent(t *testing.T) {
 
 func client(
 	t *testing.T,
-	a *agent.Agent,
+	a *Agent,
 	tlsConfig *tls.Config,
 ) api.LogClient {
 	t.Helper()
@@ -207,7 +227,7 @@ func client(
 
 func loadBalancedClient(
 	t *testing.T,
-	a *agent.Agent,
+	a *Agent,
 	tlsConfig *tls.Config,
 ) api.LogClient {
 	t.Helper()
@@ -234,4 +254,40 @@ func loadBalancedClient(
 	})
 
 	return api.NewLogClient(conn)
+}
+
+func TestRPCAddr(t *testing.T) {
+	tests := []struct {
+		name          string
+		bindAddr      string
+		advertiseHost string
+		want          string
+	}{
+		{
+			name:     "derive advertise host from bind address",
+			bindAddr: "127.0.0.1:8401",
+			want:     "127.0.0.1:8400",
+		},
+		{
+			name:          "explicit advertise host",
+			bindAddr:      "0.0.0.0:8401",
+			advertiseHost: "192.168.10.11",
+			want:          "192.168.10.11:8400",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := Config{
+				BindAddr:         tt.bindAddr,
+				RPCPort:          8400,
+				RPCAdvertiseHost: tt.advertiseHost,
+			}
+
+			got, err := config.RPCAddr()
+
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
 }

@@ -1,37 +1,19 @@
 package discovery
 
-/*
-- serf is a distributed cluster-membersip and event-propagation system
-- serf uses SWIM protocol
-- SWIM is designed to solve two problems:
-1. Failure detection.
-2. Dissemination of membership updates.
-Serf builds on SWIM and adds practical functionality such as event handling,
-cluster orchestration, and user-defined events.
-*/
-
 import (
 	"net"
+	"sync"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
 	"go.uber.org/zap"
 )
 
-// contract for responding to membership changes
 type Handler interface {
 	Join(name string, addr string) error
 	Leave(name string) error
 }
-
-/*
-Field			Purpose												Example
--------------------------------------------------------------------------------------------
-NodeName		Unique identity of this Serf node					scribe-1
-BindAddr		Local address where Serf listens					127.0.0.1:7946
-Tags			Metadata distributed with membership information	rpc_addr=127.0.0.1:8400
-StartJoinAddrs	Existing Serf nodes to contact when joining			127.0.0.1:7947
-*/
 
 type Config struct {
 	NodeName       string
@@ -40,40 +22,37 @@ type Config struct {
 	StartJoinAddrs []string
 }
 
-// type wrapping serf to provide discovery
-// Config - local node configuration
-// handler - notifies when membership changes
-// serf - serf instance
-// events - receives membership event emitted by serf
-// logger - records errors encountered while processing events
 type Membership struct {
 	Config
+
 	handler Handler
 	serf    *serf.Serf
 	events  chan serf.Event
 	logger  *zap.Logger
+
+	stopCh           chan struct{}
+	eventHandlerDone chan struct{}
+
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
-// constructor to create the Membership object
-// delegates the Serf initialization to setupSerf
 func New(handler Handler, config Config) (*Membership, error) {
-	c := &Membership{
-		Config:  config,
-		handler: handler,
-		logger:  zap.L().Named("membership"),
+	m := &Membership{
+		Config:           config,
+		handler:          handler,
+		logger:           zap.L().Named("membership"),
+		stopCh:           make(chan struct{}),
+		eventHandlerDone: make(chan struct{}),
 	}
-	err := c.setupSerf()
-	if err != nil {
+
+	if err := m.setupSerf(); err != nil {
 		return nil, err
 	}
-	return c, nil
+
+	return m, nil
 }
 
-// resolve the bind address
-// start default Serf configuration
-// configure the event channel, when memberships happen send to this channel
-// configure node identity and metadata
-// create the Serf instance
 func (m *Membership) setupSerf() error {
 	addr, err := net.ResolveTCPAddr("tcp", m.BindAddr)
 	if err != nil {
@@ -85,48 +64,78 @@ func (m *Membership) setupSerf() error {
 
 	config.MemberlistConfig.BindAddr = addr.IP.String()
 	config.MemberlistConfig.BindPort = addr.Port
+
 	m.events = make(chan serf.Event)
 
 	config.EventCh = m.events
 	config.Tags = m.Tags
 	config.NodeName = m.NodeName
+
 	m.serf, err = serf.Create(config)
 	if err != nil {
 		return err
 	}
-	// start goroutine to continuously consume events from Serf
+
 	go m.eventHandler()
-	// join an existing cluster if configured
-	if m.StartJoinAddrs != nil {
-		_, err = m.serf.Join(m.StartJoinAddrs, true)
-		if err != nil {
+
+	if len(m.StartJoinAddrs) > 0 {
+		if _, err = m.serf.Join(m.StartJoinAddrs, true); err != nil {
+			_ = m.Shutdown()
 			return err
 		}
 	}
+
 	return nil
 }
 
-// processing membership events
-// member joins - multiple membership events into single event
-// member leaves or fails, EventMemberLeave - graceful departure,
-// EventMemberFailed - unexpected failure
 func (m *Membership) eventHandler() {
-	for e := range m.events {
-		switch e.EventType() {
-		case serf.EventMemberJoin:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
-					continue
-				}
-				m.handleJoin(member)
+	defer close(m.eventHandlerDone)
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+
+		case e, ok := <-m.events:
+			if !ok {
+				return
 			}
-		case serf.EventMemberLeave, serf.EventMemberFailed:
-			for _, member := range e.(serf.MemberEvent).Members {
-				if m.isLocal(member) {
-					continue
+
+			switch e.EventType() {
+			case serf.EventMemberJoin:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					m.handleJoin(member)
 				}
-				m.handleLeave(member)
+
+			case serf.EventMemberLeave:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					//m.handleFail(member)
+					m.logger.Info(
+						"member departed",
+						zap.String("name", member.Name),
+						zap.String("event", string(e.EventType())),
+					)
+				}
+			case serf.EventMemberFailed:
+				for _, member := range e.(serf.MemberEvent).Members {
+					if m.isLocal(member) {
+						continue
+					}
+					//m.handleFail(member)
+					m.logger.Info(
+						"member departed",
+						zap.String("name", member.Name),
+						zap.String("event", string(e.EventType())),
+					)
+				}
 			}
+
 		}
 	}
 }
@@ -141,30 +150,99 @@ func (m *Membership) handleJoin(member serf.Member) {
 	}
 }
 
-func (m *Membership) handleLeave(member serf.Member) {
-	err := m.handler.Leave(
-		member.Name,
-	)
+func (m *Membership) handleFail(member serf.Member) {
+	err := m.handler.Leave(member.Name)
 	if err != nil {
 		m.logError(err, "failed to leave", member)
 	}
 }
 
+func (m *Membership) handleLeave(member serf.Member) {
+	const (
+		maxRetries = 10
+		retryDelay = time.Second
+	)
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		err := m.handler.Leave(member.Name)
+		if err == nil {
+			m.logger.Info("successfully removed departed member from Raft",
+				zap.String("name", member.Name),
+			)
+			return
+		}
+
+		if err != raft.ErrNotLeader {
+			m.logError(err, "failed to leave", member)
+			return
+		}
+
+		if attempt == maxRetries {
+			break
+		}
+
+		timer := time.NewTimer(retryDelay)
+
+		select {
+		case <-timer.C:
+		case <-m.stopCh:
+			timer.Stop()
+			return
+		}
+	}
+
+	m.logger.Warn("exhausted retries removing departed member",
+		zap.String("name", member.Name),
+	)
+}
+
 func (m *Membership) isLocal(member serf.Member) bool {
 	return m.serf.LocalMember().Name == member.Name
 }
+
 func (m *Membership) Members() []serf.Member {
 	return m.serf.Members()
 }
+
+// Leave broadcasts a graceful departure but keeps the event handler running.
+// Use Shutdown when the Membership instance itself is being stopped.
 func (m *Membership) Leave() error {
 	return m.serf.Leave()
 }
 
+// Shutdown stops membership processing before the caller shuts down Raft.
+//
+// It is safe to call multiple times.
+func (m *Membership) Shutdown() error {
+	m.shutdownOnce.Do(func() {
+		// First broadcast the graceful departure while Serf is still running.
+		leaveErr := m.serf.Leave()
+
+		// Stop Serf's network activity and background goroutines.
+		serfShutdownErr := m.serf.Shutdown()
+
+		// Stop our event handler and wait for any in-flight handler.Join/Leave
+		// call to finish before the Agent closes the Raft instance.
+		close(m.stopCh)
+		<-m.eventHandlerDone
+
+		if leaveErr != nil {
+			m.shutdownErr = leaveErr
+		} else if serfShutdownErr != nil {
+			m.shutdownErr = serfShutdownErr
+		}
+	})
+
+	return m.shutdownErr
+}
+
 func (m *Membership) logError(err error, msg string, member serf.Member) {
 	log := m.logger.Error
+
 	if err == raft.ErrNotLeader {
 		log = m.logger.Debug
 	}
+
 	log(
 		msg,
 		zap.Error(err),

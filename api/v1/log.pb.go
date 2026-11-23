@@ -346,10 +346,16 @@ func (x *GetServersResponse) GetServers() []*Server {
 }
 
 type Server struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	RpcAddr       string                 `protobuf:"bytes,2,opt,name=rpc_addr,json=rpcAddr,proto3" json:"rpc_addr,omitempty"`
-	IsLeader      bool                   `protobuf:"varint,3,opt,name=is_leader,json=isLeader,proto3" json:"is_leader,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Id      string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	RpcAddr string                 `protobuf:"bytes,2,opt,name=rpc_addr,json=rpcAddr,proto3" json:"rpc_addr,omitempty"`
+	// Raft information
+	IsLeader     bool   `protobuf:"varint,3,opt,name=is_leader,json=isLeader,proto3" json:"is_leader,omitempty"`
+	IsRaftMember bool   `protobuf:"varint,4,opt,name=is_raft_member,json=isRaftMember,proto3" json:"is_raft_member,omitempty"`
+	RaftRole     string `protobuf:"bytes,5,opt,name=raft_role,json=raftRole,proto3" json:"raft_role,omitempty"`
+	// Serf information
+	IsOnline      bool   `protobuf:"varint,6,opt,name=is_online,json=isOnline,proto3" json:"is_online,omitempty"`
+	SerfStatus    string `protobuf:"bytes,7,opt,name=serf_status,json=serfStatus,proto3" json:"serf_status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -405,6 +411,34 @@ func (x *Server) GetIsLeader() bool {
 	return false
 }
 
+func (x *Server) GetIsRaftMember() bool {
+	if x != nil {
+		return x.IsRaftMember
+	}
+	return false
+}
+
+func (x *Server) GetRaftRole() string {
+	if x != nil {
+		return x.RaftRole
+	}
+	return ""
+}
+
+func (x *Server) GetIsOnline() bool {
+	if x != nil {
+		return x.IsOnline
+	}
+	return false
+}
+
+func (x *Server) GetSerfStatus() string {
+	if x != nil {
+		return x.SerfStatus
+	}
+	return ""
+}
+
 var File_api_v1_log_proto protoreflect.FileDescriptor
 
 const file_api_v1_log_proto_rawDesc = "" +
@@ -425,11 +459,16 @@ const file_api_v1_log_proto_rawDesc = "" +
 	"\x06record\x18\x02 \x01(\v2\x0e.log.v1.RecordR\x06record\"\x13\n" +
 	"\x11GetServersRequest\">\n" +
 	"\x12GetServersResponse\x12(\n" +
-	"\aservers\x18\x01 \x03(\v2\x0e.log.v1.ServerR\aservers\"P\n" +
+	"\aservers\x18\x01 \x03(\v2\x0e.log.v1.ServerR\aservers\"\xd1\x01\n" +
 	"\x06Server\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\brpc_addr\x18\x02 \x01(\tR\arpcAddr\x12\x1b\n" +
-	"\tis_leader\x18\x03 \x01(\bR\bisLeader2\xd6\x02\n" +
+	"\tis_leader\x18\x03 \x01(\bR\bisLeader\x12$\n" +
+	"\x0eis_raft_member\x18\x04 \x01(\bR\fisRaftMember\x12\x1b\n" +
+	"\traft_role\x18\x05 \x01(\tR\braftRole\x12\x1b\n" +
+	"\tis_online\x18\x06 \x01(\bR\bisOnline\x12\x1f\n" +
+	"\vserf_status\x18\a \x01(\tR\n" +
+	"serfStatus2\xd6\x02\n" +
 	"\x03Log\x12<\n" +
 	"\aProduce\x12\x16.log.v1.ProduceRequest\x1a\x17.log.v1.ProduceResponse\"\x00\x12<\n" +
 	"\aConsume\x12\x16.log.v1.ConsumeRequest\x1a\x17.log.v1.ConsumeResponse\"\x00\x12D\n" +

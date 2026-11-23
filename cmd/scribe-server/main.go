@@ -1,173 +1,396 @@
 package main
 
 /*
-Node	Serf membership port	gRPC/Raft port	Data directory
---------------------------------------------------------------
-node-1			8401				8400		data/node-1
-node-2			8403				8402		data/node-2
-node-3			8405				8404		data/node-3
+./bin/scribe-server --help
 
-Terminal 1:
-SCRIBE_NODE_NAME=node-1 \
-SCRIBE_BIND_ADDR=127.0.0.1:8401 \
-SCRIBE_RPC_PORT=8400 \
-SCRIBE_DATA_DIR=./data/node-1 \
-SCRIBE_BOOTSTRAP=true \
-./bin/scribe-server
+# Terminal 1
+./bin/scribe-server --config-file "${HOME}/.scribe/node-1.yaml"
 
-Terminal 2:
-SCRIBE_NODE_NAME=node-2 \
-SCRIBE_BIND_ADDR=127.0.0.1:8403 \
-SCRIBE_RPC_PORT=8402 \
-SCRIBE_DATA_DIR=./data/node-2 \
-SCRIBE_BOOTSTRAP=false \
-SCRIBE_START_JOIN_ADDRS=127.0.0.1:8401 \
-./bin/scribe-server
+# Terminal 2
+./bin/scribe-server --config-file "${HOME}/.scribe/node-2.yaml"
 
-SCRIBE_NODE_NAME=node-3 \
-SCRIBE_BIND_ADDR=127.0.0.1:8405 \
-SCRIBE_RPC_PORT=8404 \
-SCRIBE_DATA_DIR=./data/node-3 \
-SCRIBE_BOOTSTRAP=false \
-SCRIBE_START_JOIN_ADDRS=127.0.0.1:8401 \
-./bin/scribe-server
+# Terminal 3
+./bin/scribe-server --config-file "${HOME}/.scribe/node-3.yaml"
+
+CLI flags
+    |
+    v
+Environment variables (SCRIBE_*)
+    |
+    v
+YAML configuration
+    |
+    v
+CLI defaults
 */
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/IamRitwik/scribe/internal/agent"
 	"github.com/IamRitwik/scribe/internal/config"
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"go.uber.org/zap"
 )
 
-func env(key string, fallback string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return fallback
+type cli struct {
+	v      *viper.Viper
+	logger *zap.Logger
 }
 
 func main() {
+	if err := newCLI().execute(); err != nil {
+		log.Fatalf("scribe-server: %v", err)
+	}
+}
+
+func newCLI() *cli {
+	return &cli{
+		v: viper.New(),
+	}
+}
+
+func (c *cli) execute() error {
+	cmd := &cobra.Command{
+		Use:          "scribe-server",
+		Short:        "Start a Scribe distributed log node",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		PreRunE:      c.loadConfig,
+		RunE:         c.run,
+	}
+
+	c.addFlags(cmd)
+
+	if err := c.v.BindPFlags(cmd.Flags()); err != nil {
+		return fmt.Errorf("bind CLI flags: %w", err)
+	}
+
+	c.v.SetEnvPrefix("SCRIBE")
+	c.v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	c.v.AutomaticEnv()
+
+	return cmd.Execute()
+}
+
+func (c *cli) addFlags(cmd *cobra.Command) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("get home directory: %v", err)
+	}
+
+	configDir := filepath.Join(home, ".scribe")
+
+	cmd.Flags().String(
+		"config-file",
+		filepath.Join(configDir, "config.yaml"),
+		"Path to the Scribe configuration file.",
+	)
+
+	cmd.Flags().String(
+		"data-dir",
+		filepath.Join(".", "data", "scribe"),
+		"Directory containing this node's persistent data.",
+	)
+
+	cmd.Flags().String("node-name", "", "Unique node identity.")
+
+	cmd.Flags().String(
+		"bind-addr",
+		"127.0.0.1:8401",
+		"Serf membership bind address.",
+	)
+
+	cmd.Flags().Int(
+		"rpc-port",
+		8400,
+		"Shared gRPC and Raft TCP port.",
+	)
+
+	cmd.Flags().String(
+		"rpc-advertise-host",
+		"",
+		"Host advertised to clients and Raft peers. Defaults to the host derived from bind-addr.",
+	)
+
+	cmd.Flags().StringSlice(
+		"start-join-addrs",
+		nil,
+		"Serf addresses to join. Supply multiple addresses separated by commas.",
+	)
+
+	cmd.Flags().Bool(
+		"bootstrap",
+		false,
+		"Bootstrap a brand-new Raft cluster. Use true only for its initial node.",
+	)
+
+	cmd.Flags().String("acl-model-file", "", "Path to the ACL model.")
+	cmd.Flags().String("acl-policy-file", "", "Path to the ACL policy.")
+
+	cmd.Flags().String("server-tls-cert-file", "", "Server TLS certificate.")
+	cmd.Flags().String("server-tls-key-file", "", "Server TLS private key.")
+	cmd.Flags().String("server-tls-ca-file", "", "CA certificate used to verify clients.")
+
+	cmd.Flags().String("peer-tls-cert-file", "", "Raft peer TLS certificate.")
+	cmd.Flags().String("peer-tls-key-file", "", "Raft peer TLS private key.")
+	cmd.Flags().String("peer-tls-ca-file", "", "CA certificate used to verify Raft peers.")
+	cmd.Flags().String(
+		"peer-tls-server-address",
+		"127.0.0.1",
+		"Server name/IP used when verifying the Raft peer certificate.",
+	)
+}
+
+func (c *cli) loadConfig(cmd *cobra.Command, args []string) error {
+	configFile, err := cmd.Flags().GetString("config-file")
+	if err != nil {
+		return err
+	}
+
+	configFile = expandPath(configFile)
+
+	c.v.SetConfigFile(configFile)
+
+	if err := c.v.ReadInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if errors.As(err, &notFound) {
+			return fmt.Errorf(
+				"configuration file %q not found; create it or pass --config-file",
+				configFile,
+			)
+		}
+		return fmt.Errorf("read configuration file: %w", err)
+	}
+
+	return nil
+}
+
+func expandPath(value string) string {
+	value = os.ExpandEnv(value)
+
+	if value == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return home
+		}
+	}
+
+	if strings.HasPrefix(value, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			value = filepath.Join(home, value[2:])
+		}
+	}
+
+	return filepath.Clean(value)
+}
+
+func (c *cli) run(cmd *cobra.Command, args []string) error {
 	logger, err := zap.NewProduction()
 	if err != nil {
-		log.Fatalf("failed to initialize logger: %v", err)
+		return fmt.Errorf("initialize logger: %w", err)
 	}
-	zap.ReplaceGlobals(logger)
+
+	c.logger = logger
 	defer func() {
-		if err := logger.Sync(); err != nil {
-			log.Printf("failed to sync logger: %v", err)
-		}
+		_ = logger.Sync()
 	}()
 
-	nodeName := env("SCRIBE_NODE_NAME", "node-1")
-	bindAddr := env("SCRIBE_BIND_ADDR", "127.0.0.1:8401")
-	rpcPort, err := strconv.Atoi(env("SCRIBE_RPC_PORT", "8400"))
+	zap.ReplaceGlobals(logger)
+
+	agentConfig, err := c.buildAgentConfig()
 	if err != nil {
-		log.Fatalf("invalid RPC port: %v", err)
+		return fmt.Errorf("build agent configuration: %w", err)
 	}
 
-	dataDir := env("SCRIBE_DATA_DIR", "./data/"+nodeName)
+	if err := validateConfig(agentConfig); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
 
-	bootstrap, err := strconv.ParseBool(env("SCRIBE_BOOTSTRAP", "false"))
+	rpcAddr, err := agentConfig.RPCAddr()
 	if err != nil {
-		log.Fatalf("invalid bootstrap value: %v", err)
+		return fmt.Errorf("resolve RPC address: %w", err)
 	}
 
-	var startJoinAddrs []string
-	joinAddrs := env("SCRIBE_START_JOIN_ADDRS", "")
-	if joinAddrs != "" {
-		for _, addr := range strings.Split(joinAddrs, ",") {
-			addr = strings.TrimSpace(addr)
-			if addr != "" {
-				startJoinAddrs = append(startJoinAddrs, addr)
-			}
-		}
-	}
-
-	// Configure the client-facing gRPC server's mutual TLS.
-	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
-		CertFile: config.ServerCertFile,
-		KeyFile:  config.ServerKeyFile,
-		CAFile:   config.CAFile,
-		Server:   true,
-	})
-	if err != nil {
-		log.Fatalf("failed to configure server TLS: %v", err)
-	}
-	serverTLSConfig.MinVersion = tls.VersionTLS12
-
-	// For this local smoke test, reuse the TLS configuration.
-	// Your peer certificates must be valid for both client and server
-	// authentication. If your agent tests use a separate peerTLSConfig,
-	// use that same configuration here instead.
-	peerTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
-		CertFile:      config.RootClientCertFile,
-		KeyFile:       config.RootClientKeyFile,
-		CAFile:        config.CAFile,
-		Server:        false,
-		ServerAddress: "127.0.0.1",
-	})
-
-	if err != nil {
-		log.Fatalf("failed to configure peer TLS: %v", err)
-	}
-	peerTLSConfig.MinVersion = tls.VersionTLS12
-
-	agentConfig := agent.Config{
-		ServerTLSConfig: serverTLSConfig,
-		PeerTLSConfig:   peerTLSConfig,
-
-		DataDir: dataDir,
-
-		NodeName:       nodeName,
-		BindAddr:       bindAddr,
-		RPCPort:        rpcPort,
-		Bootstrap:      bootstrap,
-		StartJoinAddrs: startJoinAddrs,
-
-		ACLModelFile:  config.ACLModelFile,
-		ACLPolicyFile: config.ACLPolicyFile,
-	}
+	logger.Info(
+		"starting Scribe node",
+		zap.String("node", agentConfig.NodeName),
+		zap.String("serf_bind", agentConfig.BindAddr),
+		zap.String("rpc_addr", rpcAddr),
+		zap.String("data_dir", agentConfig.DataDir),
+		zap.Bool("bootstrap", agentConfig.Bootstrap),
+		zap.Strings("start_join_addrs", agentConfig.StartJoinAddrs),
+	)
 
 	scribeAgent, err := agent.New(agentConfig)
 	if err != nil {
-		log.Fatalf("failed to start Scribe agent: %v", err)
+		return fmt.Errorf("start Scribe agent: %w", err)
 	}
 
-	rpcAddr, err := scribeAgent.Config.RPCAddr()
-	if err != nil {
-		log.Fatalf("failed to get RPC address: %v", err)
-	}
-
-	log.Printf(
-		"Scribe agent started: node=%s serf=%s rpc=%s bootstrap=%t data=%s",
-		nodeName,
-		bindAddr,
-		rpcAddr,
-		bootstrap,
-		dataDir,
+	logger.Info(
+		"Scribe node started",
+		zap.String("node", agentConfig.NodeName),
+		zap.String("rpc_addr", rpcAddr),
 	)
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	<-signals
-	signal.Stop(signals)
+	return waitForShutdown(scribeAgent, logger)
+}
 
-	log.Printf("shutting down Scribe node %s...", nodeName)
+func (c *cli) buildAgentConfig() (agent.Config, error) {
+	fmt.Printf(
+		"\nCONFIG FILE: %s\n"+
+			"node-name: %q\n"+
+			"bind-addr: %q\n"+
+			"rpc-port: %d\n"+
+			"rpc-advertise-host: %q\n"+
+			"bootstrap: %v\n\n",
+		c.v.ConfigFileUsed(),
+		c.v.GetString("node-name"),
+		c.v.GetString("bind-addr"),
+		c.v.GetInt("rpc-port"),
+		c.v.GetString("rpc-advertise-host"),
+		c.v.GetBool("bootstrap"),
+	)
+	var cfg agent.Config
 
-	if err := scribeAgent.Shutdown(); err != nil {
-		if !errors.Is(err, os.ErrClosed) {
-			log.Printf("error shutting down agent: %v", err)
-		}
+	// Node configuration.
+	cfg.NodeName = c.v.GetString("node-name")
+	cfg.DataDir = expandPath(c.v.GetString("data-dir"))
+	cfg.BindAddr = c.v.GetString("bind-addr")
+	cfg.RPCPort = c.v.GetInt("rpc-port")
+	cfg.RPCAdvertiseHost = c.v.GetString("rpc-advertise-host")
+	cfg.StartJoinAddrs = c.v.GetStringSlice("start-join-addrs")
+	cfg.Bootstrap = c.v.GetBool("bootstrap")
+
+	// ACL configuration.
+	cfg.ACLModelFile = expandPath(c.v.GetString("acl-model-file"))
+	cfg.ACLPolicyFile = expandPath(c.v.GetString("acl-policy-file"))
+
+	// Server-facing gRPC TLS configuration.
+	serverTLS, err := c.buildTLSConfig(
+		"server-tls-cert-file",
+		"server-tls-key-file",
+		"server-tls-ca-file",
+		true,
+		"",
+	)
+	if err != nil {
+		return cfg, fmt.Errorf("server TLS: %w", err)
+	}
+	cfg.ServerTLSConfig = serverTLS
+
+	// Raft peer TLS configuration.
+	peerTLS, err := c.buildTLSConfig(
+		"peer-tls-cert-file",
+		"peer-tls-key-file",
+		"peer-tls-ca-file",
+		false,
+		c.v.GetString("peer-tls-server-address"),
+	)
+	if err != nil {
+		return cfg, fmt.Errorf("peer TLS: %w", err)
+	}
+	cfg.PeerTLSConfig = peerTLS
+
+	return cfg, nil
+}
+
+func (c *cli) buildTLSConfig(
+	certKey string,
+	keyKey string,
+	caKey string,
+	server bool,
+	serverAddress string,
+) (*tls.Config, error) {
+	certFile := expandPath(c.v.GetString(certKey))
+	keyFile := expandPath(c.v.GetString(keyKey))
+	caFile := expandPath(c.v.GetString(caKey))
+
+	if certFile == "" || keyFile == "" || caFile == "" {
+		return nil, fmt.Errorf(
+			"certificate, private key, and CA paths are all required",
+		)
 	}
 
-	log.Printf("Scribe node %s stopped", nodeName)
+	tlsConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      certFile,
+		KeyFile:       keyFile,
+		CAFile:        caFile,
+		Server:        server,
+		ServerAddress: serverAddress,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConfig.MinVersion = tls.VersionTLS12
+
+	return tlsConfig, nil
+}
+
+func validateConfig(cfg agent.Config) error {
+	if strings.TrimSpace(cfg.NodeName) == "" {
+		return errors.New("node-name must not be empty")
+	}
+
+	if strings.TrimSpace(cfg.DataDir) == "" {
+		return errors.New("data-dir must not be empty")
+	}
+
+	if strings.TrimSpace(cfg.BindAddr) == "" {
+		return errors.New("bind-addr must not be empty")
+	}
+
+	if cfg.RPCPort < 1 || cfg.RPCPort > 65535 {
+		return fmt.Errorf("rpc-port must be between 1 and 65535")
+	}
+
+	/*if cfg.Bootstrap && len(cfg.StartJoinAddrs) > 0 {
+		return errors.New(
+			"bootstrap=true cannot be combined with start-join-addrs; " +
+				"the initial node bootstraps locally, other nodes join it",
+		)
+	}*/
+
+	if cfg.ServerTLSConfig == nil {
+		return errors.New("server TLS configuration is required")
+	}
+
+	if cfg.PeerTLSConfig == nil {
+		return errors.New("peer TLS configuration is required")
+	}
+
+	return nil
+}
+
+func waitForShutdown(a *agent.Agent, logger *zap.Logger) error {
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
+
+	<-ctx.Done()
+
+	logger.Info("shutdown signal received")
+
+	if err := a.Shutdown(); err != nil {
+		return fmt.Errorf("graceful shutdown: %w", err)
+	}
+
+	logger.Info("Scribe node stopped")
+
+	return nil
 }
