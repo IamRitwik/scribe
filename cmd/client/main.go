@@ -1,719 +1,507 @@
 package main
 
-/*
-Three-node Scribe cluster:
-
-node-1    127.0.0.1:8400    Leader
-node-2    127.0.0.1:8402    Follower
-node-3    127.0.0.1:8404    Follower
-
-Test flow:
-
-1. Connect to the cluster through the bootstrap address.
-2. Discover all Raft members.
-3. Identify the leader and followers.
-4. Produce a record.
-5. Read the record directly from the leader.
-6. Poll each follower independently until the same record is available.
-7. Verify that every node returns the expected offset and value.
-*/
-
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
-	"log"
+	"io"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	api "github.com/IamRitwik/scribe/api/v1"
 	"github.com/IamRitwik/scribe/internal/config"
-	"github.com/IamRitwik/scribe/internal/loadbalance"
 
+	"github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"go.opencensus.io/plugin/ocgrpc"
 	"go.opencensus.io/stats/view"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 )
 
-const (
-	bootstrapAddress = "localhost:8404"
+var defaultBootstrapAddresses = []string{
+	"localhost:8400",
+	"localhost:8402",
+	"localhost:8404",
+}
 
-	replicationTimeout = 15 * time.Second
-	requestTimeout     = 2 * time.Second
+type Options struct {
+	Bootstrap  []string
+	TLSCert    string
+	TLSKey     string
+	TLSCA      string
+	TLSServer  string
+	RPCTimeout time.Duration
+}
 
-	initialBackoff = 100 * time.Millisecond
-	maxBackoff     = 1 * time.Second
-)
-
-// Node represents a discovered Scribe server.
 type Node struct {
 	ID       string
 	Address  string
 	IsLeader bool
 }
 
-// newNodeClient creates a direct connection to a particular Scribe node.
-//
-// Unlike the cluster connection, this connection does not use our
-// custom resolver or load balancer.
-func newNodeClient(
-	addr string,
-	tlsConfig *tls.Config,
-) (*grpc.ClientConn, api.LogClient, error) {
-	conn, err := grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(
-			credentials.NewTLS(tlsConfig.Clone()),
-		),
-		grpc.WithStatsHandler(
-			&ocgrpc.ClientHandler{},
-		),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"create connection to %s: %w",
-			addr,
-			err,
-		)
+type NodeHealth struct {
+	Node      Node
+	Reachable bool
+	Err       error
+}
+
+type Client struct {
+	opts      Options
+	tlsConfig *tls.Config
+	in        *bufio.Reader
+}
+
+func loadOptions() (Options, error) {
+	flags := pflag.NewFlagSet(os.Args[0], pflag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+
+	flags.StringSlice("bootstrap", defaultBootstrapAddresses,
+		"comma-separated bootstrap RPC addresses")
+	flags.String("tls-cert", config.RootClientCertFile, "client TLS certificate")
+	flags.String("tls-key", config.RootClientKeyFile, "client TLS private key")
+	flags.String("tls-ca", config.CAFile, "CA certificate used to verify Scribe nodes")
+	flags.String("tls-server-name", "localhost", "TLS server name to verify")
+	flags.Duration("rpc-timeout", 3*time.Second, "timeout for an individual RPC")
+
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		return Options{}, err
 	}
 
+	v := viper.New()
+	v.SetEnvPrefix("SCRIBE")
+	v.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	v.AutomaticEnv()
+	if err := v.BindPFlags(flags); err != nil {
+		return Options{}, fmt.Errorf("bind CLI flags: %w", err)
+	}
+
+	opts := Options{
+		Bootstrap:  v.GetStringSlice("bootstrap"),
+		TLSCert:    v.GetString("tls-cert"),
+		TLSKey:     v.GetString("tls-key"),
+		TLSCA:      v.GetString("tls-ca"),
+		TLSServer:  v.GetString("tls-server-name"),
+		RPCTimeout: v.GetDuration("rpc-timeout"),
+	}
+	if len(opts.Bootstrap) == 0 {
+		return Options{}, errors.New("at least one --bootstrap address is required")
+	}
+	if opts.RPCTimeout <= 0 {
+		return Options{}, errors.New("--rpc-timeout must be greater than zero")
+	}
+
+	// Trim accidental spaces in comma-separated bootstrap values.
+	for i := range opts.Bootstrap {
+		opts.Bootstrap[i] = strings.TrimSpace(opts.Bootstrap[i])
+		if opts.Bootstrap[i] == "" {
+			return Options{}, errors.New("bootstrap addresses cannot be empty")
+		}
+	}
+	return opts, nil
+}
+
+func newClient(opts Options) (*Client, error) {
+	tlsConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      opts.TLSCert,
+		KeyFile:       opts.TLSKey,
+		CAFile:        opts.TLSCA,
+		ServerAddress: opts.TLSServer,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure client TLS: %w", err)
+	}
+	tlsConfig.MinVersion = tls.VersionTLS12
+
+	return &Client{
+		opts:      opts,
+		tlsConfig: tlsConfig,
+		in:        bufio.NewReader(os.Stdin),
+	}, nil
+}
+
+// newNodeClient deliberately creates a direct connection to one node.
+// This client does not depend on Scribe's custom resolver or picker.
+func (c *Client) newNodeClient(addr string) (*grpc.ClientConn, api.LogClient, error) {
+	conn, err := grpc.NewClient(
+		addr,
+		grpc.WithTransportCredentials(credentials.NewTLS(c.tlsConfig.Clone())),
+		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create connection to %s: %w", addr, err)
+	}
 	return conn, api.NewLogClient(conn), nil
 }
 
-// discoverCluster obtains the Raft membership through the bootstrap address.
-//
-// The bootstrap address is only an entry point. It does not have to be
-// the leader.
-func discoverCluster(
-	client api.LogClient,
-) ([]Node, error) {
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		15*time.Second,
-	)
-	defer cancel()
+// discoverCluster tries every configured seed in order. A seed is only an
+// entry point; it does not need to be the Raft leader.
+func (c *Client) discoverCluster() ([]Node, string, error) {
+	var failures []string
 
-	response, err := client.GetServers(
-		ctx,
-		&api.GetServersRequest{},
-		grpc.WaitForReady(true),
-	)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"discover cluster: %w",
-			err,
-		)
-	}
+	for _, seed := range c.opts.Bootstrap {
+		fmt.Printf("Trying bootstrap seed %s...\n", seed)
 
-	var nodes []Node
-
-	for _, server := range response.Servers {
-		nodes = append(nodes, Node{
-			ID:       server.Id,
-			Address:  server.RpcAddr,
-			IsLeader: server.IsLeader,
-		})
-	}
-
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf(
-			"cluster discovery returned no servers",
-		)
-	}
-
-	return nodes, nil
-}
-
-// printCluster displays the discovered Raft membership.
-func printCluster(nodes []Node) {
-	fmt.Println("\nDiscovered Scribe cluster:")
-
-	for _, node := range nodes {
-		role := "FOLLOWER"
-
-		if node.IsLeader {
-			role = "LEADER"
+		conn, rpcClient, err := c.newNodeClient(seed)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", seed, err))
+			continue
 		}
 
-		fmt.Printf(
-			"Node: %-10s Address: %-22s Role: %s\n",
-			node.ID,
-			node.Address,
-			role,
-		)
+		ctx, cancel := context.WithTimeout(context.Background(), c.opts.RPCTimeout)
+		response, err := rpcClient.GetServers(ctx, &api.GetServersRequest{})
+		cancel()
+		_ = conn.Close()
+
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", seed, err))
+			continue
+		}
+		if response == nil || len(response.Servers) == 0 {
+			failures = append(failures, fmt.Sprintf("%s: discovery returned no servers", seed))
+			continue
+		}
+
+		nodes := make([]Node, 0, len(response.Servers))
+		seen := make(map[string]struct{}, len(response.Servers))
+		for _, server := range response.Servers {
+			if server == nil || server.RpcAddr == "" {
+				continue
+			}
+			if _, ok := seen[server.RpcAddr]; ok {
+				continue
+			}
+			seen[server.RpcAddr] = struct{}{}
+			nodes = append(nodes, Node{
+				ID:       server.Id,
+				Address:  server.RpcAddr,
+				IsLeader: server.IsLeader,
+			})
+		}
+		if len(nodes) == 0 {
+			failures = append(failures, fmt.Sprintf("%s: discovery returned no usable server addresses", seed))
+			continue
+		}
+
+		fmt.Printf("Discovered %d Raft member(s) through %s.\n", len(nodes), seed)
+		return nodes, seed, nil
 	}
+
+	return nil, "", fmt.Errorf("all bootstrap seeds failed:\n%s", strings.Join(failures, "\n"))
 }
 
-// findLeader identifies the current leader from the discovered membership.
 func findLeader(nodes []Node) (Node, error) {
 	var leader Node
-	leaderFound := false
-
+	found := false
 	for _, node := range nodes {
 		if !node.IsLeader {
 			continue
 		}
-
-		if leaderFound {
-			return Node{}, fmt.Errorf(
-				"multiple leaders discovered",
-			)
+		if found {
+			return Node{}, errors.New("discovery reported more than one leader")
 		}
-
-		leader = node
-		leaderFound = true
+		leader, found = node, true
 	}
-
-	if !leaderFound {
-		return Node{}, fmt.Errorf(
-			"no leader found in discovered cluster",
-		)
+	if !found {
+		return Node{}, errors.New("no leader is currently reported; retry discovery after the Raft election")
 	}
-
 	return leader, nil
 }
 
-// findFollowers returns all discovered followers.
-func findFollowers(nodes []Node) []Node {
-	var followers []Node
-
+func printCluster(nodes []Node) {
+	fmt.Println("\nDiscovered Raft configuration:")
 	for _, node := range nodes {
-		if !node.IsLeader {
-			followers = append(followers, node)
+		role := "FOLLOWER"
+		if node.IsLeader {
+			role = "LEADER"
 		}
+		fmt.Printf("  %-12s %-24s %s\n", node.ID, node.Address, role)
 	}
-
-	return followers
 }
 
-// isRetryableConsumeError identifies errors that may resolve after
-// a follower catches up with the leader.
-func isRetryableConsumeError(err error) bool {
+func (c *Client) checkNode(node Node) NodeHealth {
+	conn, rpcClient, err := c.newNodeClient(node.Address)
+	if err != nil {
+		return NodeHealth{Node: node, Err: err}
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), c.opts.RPCTimeout)
+	defer cancel()
+	_, err = rpcClient.GetServers(ctx, &api.GetServersRequest{})
+	return NodeHealth{Node: node, Reachable: err == nil, Err: err}
+}
+
+func (c *Client) showClusterStatus() error {
+	nodes, seed, err := c.discoverCluster()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nDiscovery source: %s\n", seed)
+	printCluster(nodes)
+
+	results := make([]NodeHealth, len(nodes))
+	var wg sync.WaitGroup
+	for i, node := range nodes {
+		i, node := i, node
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = c.checkNode(node)
+		}()
+	}
+	wg.Wait()
+
+	reachable := 0
+	fmt.Println("\nRPC reachability:")
+	for _, result := range results {
+		state := "UNREACHABLE"
+		if result.Reachable {
+			state = "REACHABLE"
+			reachable++
+		}
+		fmt.Printf("  %-12s %-24s %-12s", result.Node.ID, result.Node.Address, state)
+		if result.Err != nil {
+			fmt.Printf(" (%v)", result.Err)
+		}
+		fmt.Println()
+	}
+
+	// This is only a rough client-side estimate. It assumes all configured
+	// Raft servers are voters and does not prove that Raft has quorum.
+	required := len(nodes)/2 + 1
+	fmt.Printf("\nReachable RPC endpoints: %d/%d\n", reachable, len(nodes))
+	fmt.Printf("Estimated majority (assuming all members are voters): %d/%d\n", required, len(nodes))
+	if reachable >= required {
+		fmt.Println("The reachable-node count meets the estimated majority.")
+	} else {
+		fmt.Println("The reachable-node count is below the estimated majority.")
+	}
+	fmt.Println("Note: RPC reachability is not proof of Raft quorum or replication health.")
+	return nil
+}
+
+func (c *Client) produce() error {
+	nodes, _, err := c.discoverCluster()
+	if err != nil {
+		return err
+	}
+	leader, err := findLeader(nodes)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Current leader: %s (%s)\n", leader.ID, leader.Address)
+	fmt.Print("Record value (one line): ")
+	value, err := c.readLine()
+	if err != nil {
+		return err
+	}
+	if value == "" {
+		return errors.New("record value cannot be empty")
+	}
+
+	conn, rpcClient, err := c.newNodeClient(leader.Address)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	response, err := rpcClient.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{Value: []byte(value)},
+	})
+	if err != nil {
+		// Do not retry automatically. A timeout can occur after the server
+		// committed the record but before the response reached this client.
+		return fmt.Errorf(
+			"produce through leader %s failed: %w\n"+
+				"Do not blindly retry: the record may have committed. Rediscover and consume the expected offset before retrying",
+			leader.ID, err,
+		)
+	}
+
+	fmt.Printf("Produced successfully. Offset: %d\n", response.Offset)
+	return nil
+}
+
+func isOffsetUnavailable(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	switch status.Code(err) {
-	case codes.NotFound,
-		codes.Unavailable,
-		codes.DeadlineExceeded,
-		codes.ResourceExhausted,
-		codes.Aborted:
+	if status.Code(err) == codes.NotFound {
 		return true
 	}
-
-	// Compatibility with Scribe's current application error:
-	//
-	// rpc error: code = Code(404) desc = offset out of range
-	//
-	// We should eventually map this error consistently to
-	// gRPC codes.NotFound in the server.
-	return strings.Contains(
-		strings.ToLower(err.Error()),
-		"offset out of range",
-	)
+	return strings.Contains(strings.ToLower(err.Error()), "offset out of range")
 }
 
-// consumeFromNode reads an offset directly from one specific node.
-func consumeFromNode(
-	ctx context.Context,
-	client api.LogClient,
-	offset uint64,
-) (*api.ConsumeResponse, error) {
-	requestCtx, cancel := context.WithTimeout(
-		ctx,
-		requestTimeout,
-	)
-	defer cancel()
+func isNodeUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded:
+		return true
+	default:
+		return false
+	}
+}
 
-	response, err := client.Consume(
-		requestCtx,
-		&api.ConsumeRequest{
-			Offset: offset,
-		},
-		grpc.WaitForReady(true),
-	)
+func (c *Client) consume() error {
+	nodes, _, err := c.discoverCluster()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	if response.Record == nil {
-		return nil, fmt.Errorf(
-			"consume returned an empty record",
-		)
-	}
-
-	return response, nil
-}
-
-// verifyRecord checks that the returned record matches the expected
-// offset and value.
-func verifyRecord(
-	response *api.ConsumeResponse,
-	expectedOffset uint64,
-	expectedValue []byte,
-) error {
-	if response.Record == nil {
-		return fmt.Errorf("response contains no record")
-	}
-
-	if response.Record.Offset != expectedOffset {
-		return fmt.Errorf(
-			"unexpected offset: got %d, want %d",
-			response.Record.Offset,
-			expectedOffset,
-		)
-	}
-
-	if !bytes.Equal(
-		response.Record.Value,
-		expectedValue,
-	) {
-		return fmt.Errorf(
-			"record value does not match the produced value",
-		)
-	}
-
-	return nil
-}
-
-// readFromLeader verifies that the leader can immediately read the record
-// returned by its successful Produce operation.
-func readFromLeader(
-	node Node,
-	client api.LogClient,
-	offset uint64,
-	expectedValue []byte,
-) error {
-	fmt.Printf(
-		"\nReading offset %d directly from leader %s (%s)...\n",
-		offset,
-		node.ID,
-		node.Address,
-	)
-
-	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		5*time.Second,
-	)
-	defer cancel()
-
-	response, err := consumeFromNode(
-		ctx,
-		client,
-		offset,
-	)
+	fmt.Print("Offset to consume: ")
+	rawOffset, err := c.readLine()
 	if err != nil {
-		return fmt.Errorf(
-			"leader %s could not read offset %d: %w",
-			node.ID,
-			offset,
-			err,
-		)
+		return err
+	}
+	offset, err := strconv.ParseUint(strings.TrimSpace(rawOffset), 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid offset %q: %w", rawOffset, err)
 	}
 
-	if err := verifyRecord(
-		response,
-		offset,
-		expectedValue,
-	); err != nil {
-		return fmt.Errorf(
-			"leader record verification failed: %w",
-			err,
-		)
+	// Prefer followers for reads, then fall back to the leader. The service
+	// currently exposes local reads, so a follower may not have applied the
+	// requested offset yet.
+	ordered := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		if !node.IsLeader {
+			ordered = append(ordered, node)
+		}
+	}
+	for _, node := range nodes {
+		if node.IsLeader {
+			ordered = append(ordered, node)
+		}
 	}
 
-	fmt.Printf(
-		"Leader %s successfully read offset %d: %q\n",
-		node.ID,
-		offset,
-		string(response.Record.Value),
-	)
-
-	return nil
-}
-
-// waitForRecord repeatedly consumes the requested offset from one follower.
-//
-// It stops when:
-//   - The expected record becomes available.
-//   - A non-retryable error occurs.
-//   - The overall context deadline expires.
-func waitForRecord(
-	ctx context.Context,
-	node Node,
-	client api.LogClient,
-	offset uint64,
-	expectedValue []byte,
-) error {
-	backoff := initialBackoff
-	attempt := 0
-
-	fmt.Printf(
-		"\nWaiting for follower %s (%s) to apply offset %d...\n",
-		node.ID,
-		node.Address,
-		offset,
-	)
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf(
-				"follower %s did not apply offset %d: %w",
-				node.ID,
-				offset,
-				err,
-			)
+	var failures []string
+	for _, node := range ordered {
+		conn, rpcClient, dialErr := c.newNodeClient(node.Address)
+		if dialErr != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", node.ID, dialErr))
+			continue
 		}
 
-		attempt++
+		ctx, cancel := context.WithTimeout(context.Background(), c.opts.RPCTimeout)
+		response, callErr := rpcClient.Consume(ctx, &api.ConsumeRequest{Offset: offset})
+		cancel()
+		_ = conn.Close()
 
-		response, err := consumeFromNode(
-			ctx,
-			client,
-			offset,
-		)
-
-		if err == nil {
-			if err := verifyRecord(
-				response,
-				offset,
-				expectedValue,
-			); err != nil {
-				return fmt.Errorf(
-					"follower %s returned an unexpected record: %w",
-					node.ID,
-					err,
-				)
+		if callErr == nil {
+			if response == nil || response.Record == nil {
+				failures = append(failures, fmt.Sprintf("%s: empty consume response", node.ID))
+				continue
 			}
-
-			fmt.Printf(
-				"Follower %s successfully applied offset %d: %q (attempt %d)\n",
-				node.ID,
-				offset,
-				string(response.Record.Value),
-				attempt,
-			)
-
+			if response.Record.Offset != offset {
+				return fmt.Errorf("%s returned offset %d; requested %d", node.ID, response.Record.Offset, offset)
+			}
+			fmt.Printf("\nConsumed from %s (%s)\n", node.ID, node.Address)
+			fmt.Printf("Offset: %d\n", response.Record.Offset)
+			fmt.Printf("Value:  %s\n", string(response.Record.Value))
 			return nil
 		}
 
-		if !isRetryableConsumeError(err) {
-			return fmt.Errorf(
-				"non-retryable error from follower %s: %w",
-				node.ID,
-				err,
-			)
-		}
-
-		fmt.Printf(
-			"Follower %s is not ready yet (attempt %d): %v\n",
-			node.ID,
-			attempt,
-			err,
-		)
-
-		timer := time.NewTimer(backoff)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-
-			return fmt.Errorf(
-				"timed out waiting for follower %s: %w",
-				node.ID,
-				ctx.Err(),
-			)
-
-		case <-timer.C:
-		}
-
-		backoff *= 2
-
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		failures = append(failures, fmt.Sprintf("%s: %v", node.ID, callErr))
+		if !isOffsetUnavailable(callErr) && !isNodeUnavailable(callErr) {
+			// Authentication, malformed requests, and other application errors
+			// are not made better by trying every other node.
+			return fmt.Errorf("consume from %s failed: %w", node.ID, callErr)
 		}
 	}
+
+	return fmt.Errorf("could not read offset %d from any discovered node:\n%s",
+		offset, strings.Join(failures, "\n"))
 }
 
-// verifyFollowers polls all followers concurrently.
-//
-// Each follower gets its own deadline, so one slow follower does not
-// consume the time budget of another follower.
-func verifyFollowers(
-	followers []Node,
-	tlsConfig *tls.Config,
-	offset uint64,
-	expectedValue []byte,
-) error {
-	if len(followers) == 0 {
-		return fmt.Errorf("no followers discovered")
+func (c *Client) readLine() (string, error) {
+	line, err := c.in.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
 	}
+	line = strings.TrimSpace(line)
+	if errors.Is(err, io.EOF) && line == "" {
+		return "", io.EOF
+	}
+	return line, nil
+}
 
-	var wg sync.WaitGroup
+func (c *Client) run() error {
+	fmt.Println("Scribe interactive client")
+	fmt.Println("Bootstrap seeds:", strings.Join(c.opts.Bootstrap, ", "))
 
-	errCh := make(chan error, len(followers))
+	for {
+		fmt.Println("\nChoose an operation:")
+		fmt.Println("  1. Discover cluster and show status")
+		fmt.Println("  2. Produce a record")
+		fmt.Println("  3. Consume a record by offset")
+		fmt.Println("  4. Exit")
+		fmt.Print("> ")
 
-	for _, follower := range followers {
-		follower := follower
-
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			conn, client, err := newNodeClient(
-				follower.Address,
-				tlsConfig,
-			)
-			if err != nil {
-				errCh <- err
-				return
+		choice, err := c.readLine()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				fmt.Println("\nInput closed; exiting.")
+				return nil
 			}
-			defer conn.Close()
+			return err
+		}
 
-			ctx, cancel := context.WithTimeout(
-				context.Background(),
-				replicationTimeout,
-			)
-			defer cancel()
-
-			if err := waitForRecord(
-				ctx,
-				follower,
-				client,
-				offset,
-				expectedValue,
-			); err != nil {
-				errCh <- err
-				return
+		switch choice {
+		case "1":
+			if err := c.showClusterStatus(); err != nil {
+				fmt.Printf("Cluster status failed: %v\n", err)
 			}
-		}()
+		case "2":
+			if err := c.produce(); err != nil {
+				fmt.Printf("Produce failed: %v\n", err)
+			}
+		case "3":
+			if err := c.consume(); err != nil {
+				fmt.Printf("Consume failed: %v\n", err)
+			}
+		case "4", "q", "quit", "exit":
+			fmt.Println("Goodbye.")
+			return nil
+		case "":
+			continue
+		default:
+			fmt.Println("Unknown choice; enter 1, 2, 3, or 4.")
+		}
 	}
-
-	wg.Wait()
-	close(errCh)
-
-	var failures []string
-
-	for err := range errCh {
-		failures = append(failures, err.Error())
-	}
-
-	if len(failures) > 0 {
-		return fmt.Errorf(
-			"follower replication verification failed:\n%s",
-			strings.Join(failures, "\n"),
-		)
-	}
-
-	return nil
 }
 
 func main() {
-	// -------------------------------------------------------------------------
-	// Metrics
-	// -------------------------------------------------------------------------
-
-	if err := view.Register(
-		ocgrpc.DefaultClientViews...,
-	); err != nil {
-		log.Fatalf(
-			"failed to register client metric views: %v",
-			err,
-		)
+	if err := view.Register(ocgrpc.DefaultClientViews...); err != nil {
+		fmt.Fprintf(os.Stderr, "register client metric views: %v\n", err)
+		os.Exit(1)
 	}
 
-	// -------------------------------------------------------------------------
-	// Client TLS
-	// -------------------------------------------------------------------------
-
-	tlsConfig, err := config.SetupTLSConfig(
-		config.TLSConfig{
-			CertFile:      config.RootClientCertFile,
-			KeyFile:       config.RootClientKeyFile,
-			CAFile:        config.CAFile,
-			ServerAddress: "localhost",
-		},
-	)
+	opts, err := loadOptions()
 	if err != nil {
-		log.Fatalf(
-			"failed to configure client TLS: %v",
-			err,
-		)
+		fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+		os.Exit(2)
 	}
 
-	tlsConfig.MinVersion = tls.VersionTLS12
-
-	// -------------------------------------------------------------------------
-	// Connect through the cluster resolver.
-	//
-	// This connection is used for cluster discovery and Produce.
-	// The resolver routes Produce to the current leader.
-	// -------------------------------------------------------------------------
-
-	target := fmt.Sprintf(
-		"%s://%s",
-		loadbalance.Name,
-		bootstrapAddress,
-	)
-
-	clusterConn, err := grpc.NewClient(
-		target,
-		grpc.WithTransportCredentials(
-			credentials.NewTLS(tlsConfig.Clone()),
-		),
-		grpc.WithStatsHandler(
-			&ocgrpc.ClientHandler{},
-		),
-	)
+	client, err := newClient(opts)
 	if err != nil {
-		log.Fatalf(
-			"failed to create cluster client: %v",
-			err,
-		)
+		fmt.Fprintf(os.Stderr, "initialize client: %v\n", err)
+		os.Exit(1)
 	}
-	defer clusterConn.Close()
-
-	clusterClient := api.NewLogClient(clusterConn)
-
-	// -------------------------------------------------------------------------
-	// 1. Discover cluster membership.
-	// -------------------------------------------------------------------------
-
-	nodes, err := discoverCluster(clusterClient)
-	if err != nil {
-		log.Fatalf("cluster discovery failed: %v", err)
+	if err := client.run(); err != nil {
+		fmt.Fprintf(os.Stderr, "client stopped: %v\n", err)
+		os.Exit(1)
 	}
-
-	printCluster(nodes)
-
-	leader, err := findLeader(nodes)
-	if err != nil {
-		log.Fatalf("leader discovery failed: %v", err)
-	}
-
-	followers := findFollowers(nodes)
-
-	fmt.Printf(
-		"\nLeader identified: %s (%s)\n",
-		leader.ID,
-		leader.Address,
-	)
-
-	fmt.Printf(
-		"Followers identified: %d\n",
-		len(followers),
-	)
-
-	// -------------------------------------------------------------------------
-	// 2. Produce a record through the cluster client.
-	// -------------------------------------------------------------------------
-
-	expectedValue := []byte(
-		"Hello Scribe! Three-node Raft cluster.",
-	)
-
-	fmt.Println("\nProducing a record...")
-
-	produceCtx, produceCancel := context.WithTimeout(
-		context.Background(),
-		15*time.Second,
-	)
-
-	produceResponse, err := clusterClient.Produce(
-		produceCtx,
-		&api.ProduceRequest{
-			Record: &api.Record{
-				Value: expectedValue,
-			},
-		},
-		grpc.WaitForReady(true),
-	)
-
-	produceCancel()
-
-	if err != nil {
-		log.Fatalf("Produce failed: %v", err)
-	}
-
-	offset := produceResponse.Offset
-
-	fmt.Printf(
-		"Produced record successfully. Offset: %d\n",
-		offset,
-	)
-
-	// -------------------------------------------------------------------------
-	// 3. Connect directly to the discovered leader.
-	// -------------------------------------------------------------------------
-
-	leaderConn, leaderClient, err := newNodeClient(
-		leader.Address,
-		tlsConfig,
-	)
-	if err != nil {
-		log.Fatalf(
-			"failed to connect to leader: %v",
-			err,
-		)
-	}
-	defer leaderConn.Close()
-
-	// -------------------------------------------------------------------------
-	// 4. Read the record directly from the leader.
-	// -------------------------------------------------------------------------
-
-	if err := readFromLeader(
-		leader,
-		leaderClient,
-		offset,
-		expectedValue,
-	); err != nil {
-		log.Fatalf("leader verification failed: %v", err)
-	}
-
-	// -------------------------------------------------------------------------
-	// 5. Poll each follower independently.
-	// -------------------------------------------------------------------------
-
-	fmt.Println(
-		"\nLeader verification succeeded. Now checking follower application logs...",
-	)
-
-	if err := verifyFollowers(
-		followers,
-		tlsConfig,
-		offset,
-		expectedValue,
-	); err != nil {
-		log.Fatalf("%v", err)
-	}
-
-	// -------------------------------------------------------------------------
-	// 6. Final result.
-	// -------------------------------------------------------------------------
-
-	fmt.Println("\n========================================")
-	fmt.Println("SCRIBE REPLICATION VERIFICATION PASSED")
-	fmt.Println("========================================")
-
-	fmt.Printf("Produced offset: %d\n", offset)
-	fmt.Printf("Leader: %s\n", leader.ID)
-
-	for _, follower := range followers {
-		fmt.Printf(
-			"Verified follower: %s (%s)\n",
-			follower.ID,
-			follower.Address,
-		)
-	}
-
-	fmt.Println("\nAll discovered followers have applied the record.")
 }
